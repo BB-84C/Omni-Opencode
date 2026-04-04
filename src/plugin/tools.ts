@@ -1,6 +1,7 @@
 import type { JobStore } from "../core/store.js"
-import type { BackendAdapter } from "../adapters/types.js"
+import type { BackendAdapter, JobHandle } from "../adapters/types.js"
 import type { SessionManager } from "./session-manager.js"
+import type { InterruptCheckpoint } from "./resume.js"
 
 export type ToolContext = {
   store: JobStore
@@ -51,6 +52,28 @@ export async function delegatedJobSnapshot(
     lastEventSeq: snapshot.lastEventSeq,
     resumable: job.resumable ?? false,
   }
+}
+
+export type ResumeOptions = {
+  instruction?: string
+  checkpoint?: InterruptCheckpoint
+}
+
+export async function delegatedJobResume(
+  ctx: ToolContext,
+  childSessionId: string,
+  opts?: ResumeOptions,
+): Promise<JobHandle> {
+  const job = await ctx.store.get(childSessionId)
+  if (!job) {
+    throw new Error(`Job not found in store: ${childSessionId}`)
+  }
+
+  const resumeId = job.backendThreadId ?? childSessionId
+  const handle = await ctx.adapter.resumeJob(resumeId, opts?.instruction)
+  await ctx.store.save({ ...job, status: "running" })
+
+  return handle
 }
 
 export async function delegatedJobCancel(
