@@ -59,9 +59,12 @@ export function createClaudeClient(): ClaudeClient {
       const sdk = sdkModule as {
         query?: (opts: {
           prompt: string
-          cwd?: string
-          resume?: string
-          options?: Record<string, unknown>
+          options?: {
+            cwd?: string
+            resume?: string
+            maxTurns?: number
+            [key: string]: unknown
+          }
         }) => AsyncIterable<unknown>
       }
 
@@ -71,8 +74,11 @@ export function createClaudeClient(): ClaudeClient {
 
       const iterable = sdk.query({
         prompt: params.prompt,
-        cwd: params.cwd,
-        resume: params.sessionId,
+        options: {
+          cwd: params.cwd,
+          resume: params.sessionId,
+          maxTurns: 10,
+        },
       })
 
       for await (const msg of iterable) {

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest"
+import { describe, expect, it } from "vitest"
 import { mapCodexEvent, createCodexAdapter } from "../src/adapters/codex-adapter.js"
 import type { CodexNotification, CodexClient } from "../src/adapters/codex-client.js"
 import type { JobStartParams } from "../src/adapters/types.js"
@@ -12,10 +12,11 @@ function createMockCodexClient(notifications: CodexNotification[]): CodexClient 
     async *subscribeNotifications() {
       yield* notifications
     },
+    close() {},
   }
 }
 
-describe("mapCodexEvent", () => {
+describe("mapCodexEvent (v2 protocol)", () => {
   it("maps turn/started → status.update", () => {
     const notification: CodexNotification = {
       method: "turn/started",
@@ -25,14 +26,14 @@ describe("mapCodexEvent", () => {
     expect(event.type).toBe("status.update")
     expect(event.sessionId).toBe("session-1")
     if (event.type === "status.update") {
-      expect(event.message).toBe("Turn started: t1")
+      expect(event.message).toBe("Turn started")
     }
   })
 
-  it("maps turn/delta → assistant.delta with correct text", () => {
+  it("maps item/agentMessage/delta → assistant.delta with delta text", () => {
     const notification: CodexNotification = {
-      method: "turn/delta",
-      params: { threadId: "t1", text: "Hello, world!" },
+      method: "item/agentMessage/delta",
+      params: { threadId: "t1", turnId: "turn-1", itemId: "item-1", delta: "Hello, world!" },
     }
     const event = mapCodexEvent(notification, "session-1")
     expect(event.type).toBe("assistant.delta")
@@ -42,58 +43,59 @@ describe("mapCodexEvent", () => {
     }
   })
 
-  it("maps turn/completed → result.final with changedFiles", () => {
+  it("maps turn/completed (status=completed) → result.final", () => {
     const notification: CodexNotification = {
       method: "turn/completed",
-      params: { threadId: "t1", summary: "Done!", changedFiles: ["foo.ts", "bar.ts"] },
+      params: { threadId: "t1", turn: { id: "turn-1", status: "completed", error: null } },
     }
     const event = mapCodexEvent(notification, "session-1")
     expect(event.type).toBe("result.final")
     expect(event.sessionId).toBe("session-1")
     if (event.type === "result.final") {
-      expect(event.summary).toBe("Done!")
-      expect(event.changedFiles).toEqual(["foo.ts", "bar.ts"])
+      expect(event.summary).toBe("Turn completed")
     }
   })
 
-  it("maps tool/start → tool.start", () => {
+  it("maps turn/completed (status=failed) → error", () => {
     const notification: CodexNotification = {
-      method: "tool/start",
-      params: { threadId: "t1", name: "bash", input: { command: "ls" } },
+      method: "turn/completed",
+      params: { threadId: "t1", turn: { id: "turn-1", status: "failed", error: { message: "oops" } } },
     }
     const event = mapCodexEvent(notification, "session-1")
-    expect(event.type).toBe("tool.start")
+    expect(event.type).toBe("error")
+  })
+
+  it("maps item/commandExecution/outputDelta → command.stdout.delta", () => {
+    const notification: CodexNotification = {
+      method: "item/commandExecution/outputDelta",
+      params: { threadId: "t1", turnId: "turn-1", itemId: "item-1", delta: "test output" },
+    }
+    const event = mapCodexEvent(notification, "session-1")
+    expect(event.type).toBe("command.stdout.delta")
     expect(event.sessionId).toBe("session-1")
-    if (event.type === "tool.start") {
-      expect(event.toolName).toBe("bash")
-      expect(event.input).toEqual({ command: "ls" })
+    if (event.type === "command.stdout.delta") {
+      expect(event.text).toBe("test output")
     }
   })
 
-  it("maps command/start → command.start", () => {
+  it("maps item/fileChange/outputDelta → status.update", () => {
     const notification: CodexNotification = {
-      method: "command/start",
-      params: { threadId: "t1", command: "npm test" },
+      method: "item/fileChange/outputDelta",
+      params: { threadId: "t1", turnId: "turn-1", itemId: "item-1", delta: "Modified src/foo.ts" },
     }
     const event = mapCodexEvent(notification, "session-1")
-    expect(event.type).toBe("command.start")
-    expect(event.sessionId).toBe("session-1")
-    if (event.type === "command.start") {
-      expect(event.command).toBe("npm test")
-    }
+    expect(event.type).toBe("status.update")
   })
 
-  it("maps file/changed → file.change", () => {
+  it("maps error notification → error event", () => {
     const notification: CodexNotification = {
-      method: "file/changed",
-      params: { threadId: "t1", path: "src/foo.ts", type: "modified" },
+      method: "error",
+      params: { message: "something went wrong" },
     }
     const event = mapCodexEvent(notification, "session-1")
-    expect(event.type).toBe("file.change")
-    expect(event.sessionId).toBe("session-1")
-    if (event.type === "file.change") {
-      expect(event.path).toBe("src/foo.ts")
-      expect(event.changeType).toBe("modified")
+    expect(event.type).toBe("error")
+    if (event.type === "error") {
+      expect(event.message).toBe("something went wrong")
     }
   })
 })
@@ -116,15 +118,18 @@ describe("createCodexAdapter", () => {
   it("subscribeEvents yields mapped canonical events from mock client notifications", async () => {
     const notifications: CodexNotification[] = [
       { method: "turn/started", params: { threadId: "t1", turnId: "turn-1" } },
-      { method: "turn/delta", params: { threadId: "t1", text: "Hello" } },
-      { method: "turn/completed", params: { threadId: "t1", summary: "All done" } },
+      {
+        method: "item/agentMessage/delta",
+        params: { threadId: "t1", turnId: "turn-1", itemId: "item-1", delta: "Hello" },
+      },
+      {
+        method: "turn/completed",
+        params: { threadId: "t1", turn: { id: "turn-1", status: "completed", error: null } },
+      },
     ]
     const client = createMockCodexClient(notifications)
     const adapter = createCodexAdapter(client)
-    const params: JobStartParams = {
-      childSessionId: "child-2",
-      prompt: "Do something",
-    }
+    const params: JobStartParams = { childSessionId: "child-2", prompt: "Do something" }
     const handle = await adapter.startJob(params)
     const events: unknown[] = []
     for await (const event of adapter.subscribeEvents(handle.id)) {

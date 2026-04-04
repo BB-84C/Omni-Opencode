@@ -2,66 +2,56 @@ import type { DelegatedEvent } from "../core/events.js"
 import type { BackendAdapter, JobHandle, JobStartParams, JobSnapshot } from "./types.js"
 import type { CodexClient, CodexNotification } from "./codex-client.js"
 
+// ---------------------------------------------------------------------------
+// Codex v2 notification → canonical DelegatedEvent mapping
+// ---------------------------------------------------------------------------
+
 export function mapCodexEvent(notification: CodexNotification, sessionId: string): DelegatedEvent {
   switch (notification.method) {
     case "turn/started":
       return {
         type: "status.update",
         sessionId,
-        message: `Turn started: ${notification.params.threadId}`,
+        message: "Turn started",
       }
-    case "turn/delta":
+
+    case "item/agentMessage/delta":
       return {
         type: "assistant.delta",
         sessionId,
-        text: notification.params.text,
+        text: notification.params.delta,
       }
-    case "turn/completed":
+
+    case "turn/completed": {
+      const { turn } = notification.params
+      if (turn.status === "failed") {
+        return {
+          type: "error",
+          sessionId,
+          message: "Turn failed",
+        }
+      }
       return {
         type: "result.final",
         sessionId,
-        summary: notification.params.summary,
-        changedFiles: notification.params.changedFiles,
+        summary: "Turn completed",
       }
-    case "tool/start":
-      return {
-        type: "tool.start",
-        sessionId,
-        toolName: notification.params.name,
-        input: notification.params.input,
-      }
-    case "tool/end":
-      return {
-        type: "tool.end",
-        sessionId,
-        toolName: notification.params.name,
-        exitCode: notification.params.exitCode,
-      }
-    case "command/start":
-      return {
-        type: "command.start",
-        sessionId,
-        command: notification.params.command,
-      }
-    case "command/stdout":
+    }
+
+    case "item/commandExecution/outputDelta":
       return {
         type: "command.stdout.delta",
         sessionId,
-        text: notification.params.text,
+        text: notification.params.delta,
       }
-    case "command/stderr":
+
+    case "item/fileChange/outputDelta":
       return {
-        type: "command.stderr.delta",
+        type: "status.update",
         sessionId,
-        text: notification.params.text,
+        message: notification.params.delta,
       }
-    case "file/changed":
-      return {
-        type: "file.change",
-        sessionId,
-        path: notification.params.path,
-        changeType: notification.params.type,
-      }
+
     case "error":
       return {
         type: "error",
@@ -70,6 +60,10 @@ export function mapCodexEvent(notification: CodexNotification, sessionId: string
       }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Adapter
+// ---------------------------------------------------------------------------
 
 type JobRecord = {
   id: string
@@ -105,32 +99,26 @@ export function createCodexAdapter(client: CodexClient): BackendAdapter {
 
     async resumeJob(jobId: string, _instruction?: string): Promise<JobHandle> {
       const record = jobs.get(jobId)
-      if (!record) {
-        throw new Error(`Unknown job: ${jobId}`)
-      }
+      if (!record) throw new Error(`Unknown job: ${jobId}`)
       record.status = "running"
       return { id: record.id, childSessionId: record.childSessionId }
     },
 
     async cancelJob(jobId: string): Promise<void> {
       const record = jobs.get(jobId)
-      if (!record) {
-        throw new Error(`Unknown job: ${jobId}`)
-      }
+      if (!record) throw new Error(`Unknown job: ${jobId}`)
       await client.cancelThread(record.threadId)
       record.status = "interrupted"
     },
 
     async *subscribeEvents(jobId: string): AsyncIterable<DelegatedEvent> {
       const record = jobs.get(jobId)
-      if (!record) {
-        throw new Error(`Unknown job: ${jobId}`)
-      }
+      if (!record) throw new Error(`Unknown job: ${jobId}`)
+
       for await (const notification of client.subscribeNotifications(record.threadId)) {
         record.lastEventSeq++
         const event = mapCodexEvent(notification, record.childSessionId)
-        if (event.type === "result.final" && event.changedFiles) {
-          record.changedFiles.push(...event.changedFiles)
+        if (event.type === "result.final") {
           record.status = "completed"
         } else if (event.type === "error") {
           record.status = "failed"
@@ -141,9 +129,7 @@ export function createCodexAdapter(client: CodexClient): BackendAdapter {
 
     async getSnapshot(jobId: string): Promise<JobSnapshot> {
       const record = jobs.get(jobId)
-      if (!record) {
-        throw new Error(`Unknown job: ${jobId}`)
-      }
+      if (!record) throw new Error(`Unknown job: ${jobId}`)
       return {
         id: record.id,
         childSessionId: record.childSessionId,
