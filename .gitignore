@@ -10,5 +10,6 @@ coverage/
 /.claude
 CLAUDE.md
 /.opencode
+.worktrees/
 opencode.json
 config.json
