@@ -155,6 +155,8 @@ describe("full delegation pipeline", { timeout: TIMEOUT * 2 }, () => {
     "orchestrates both backends and assembles a parent session report",
     async () => {
       const store = createJobStore()
+      const parentSessionId = "pipeline-parent-1"
+      const claudeJobId = `${parentSessionId}:claude-job-1`
 
       // -- Claude Code child job --
       const claudeClient = createClaudeClient()
@@ -167,6 +169,12 @@ describe("full delegation pipeline", { timeout: TIMEOUT * 2 }, () => {
       })
 
       await store.save({
+        jobId: claudeJobId,
+        parentSessionId,
+        runtimeType: "tmux",
+        runtimeHandle: claudeHandle.id,
+        attachTarget: claudeHandle.id,
+        terminalLogPath: `logs/${claudeJobId}.log`,
         childSessionId: "pipeline-claude-1",
         backend: "claude-code",
         backendThreadId: claudeHandle.id,
@@ -178,6 +186,12 @@ describe("full delegation pipeline", { timeout: TIMEOUT * 2 }, () => {
       const claudeSummary = (claudeFinal as Extract<DelegatedEvent, { type: "result.final" }>).summary
 
       await store.save({
+        jobId: claudeJobId,
+        parentSessionId,
+        runtimeType: "tmux",
+        runtimeHandle: claudeHandle.id,
+        attachTarget: claudeHandle.id,
+        terminalLogPath: `logs/${claudeJobId}.log`,
         childSessionId: "pipeline-claude-1",
         backend: "claude-code",
         backendThreadId: claudeHandle.id,
@@ -187,6 +201,7 @@ describe("full delegation pipeline", { timeout: TIMEOUT * 2 }, () => {
       // -- Codex child job (if available) --
       let codexSummary: string | null = null
       if (!SKIP_CODEX) {
+        const codexJobId = `${parentSessionId}:codex-job-1`
         if (!codexClient) codexClient = createCodexClient()
         const codexAdp = createCodexAdapter(codexClient)
 
@@ -197,6 +212,12 @@ describe("full delegation pipeline", { timeout: TIMEOUT * 2 }, () => {
         })
 
         await store.save({
+          jobId: codexJobId,
+          parentSessionId,
+          runtimeType: "tmux",
+          runtimeHandle: codexHandle.id,
+          attachTarget: codexHandle.id,
+          terminalLogPath: `logs/${codexJobId}.log`,
           childSessionId: "pipeline-codex-1",
           backend: "codex",
           backendThreadId: codexHandle.id,
@@ -208,6 +229,12 @@ describe("full delegation pipeline", { timeout: TIMEOUT * 2 }, () => {
         codexSummary = (codexFinal as Extract<DelegatedEvent, { type: "result.final" }>).summary
 
         await store.save({
+          jobId: codexJobId,
+          parentSessionId,
+          runtimeType: "tmux",
+          runtimeHandle: codexHandle.id,
+          attachTarget: codexHandle.id,
+          terminalLogPath: `logs/${codexJobId}.log`,
           childSessionId: "pipeline-codex-1",
           backend: "codex",
           backendThreadId: codexHandle.id,
@@ -234,7 +261,7 @@ describe("full delegation pipeline", { timeout: TIMEOUT * 2 }, () => {
       expect(claudeResult.projected.some(m => m.kind === "result")).toBe(true)
 
       // Verify store integrity
-      const claudeJob = await store.get("pipeline-claude-1")
+      const claudeJob = await store.get(claudeJobId)
       expect(claudeJob?.status).toBe("completed")
       expect(claudeJob?.backend).toBe("claude-code")
 

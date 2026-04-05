@@ -4,9 +4,9 @@ import type { JobRecord } from "./jobs.js"
 
 export interface JobStore {
   save(record: JobRecord): Promise<void>
-  get(childSessionId: string): Promise<JobRecord | undefined>
+  get(jobId: string): Promise<JobRecord | undefined>
   list(): Promise<JobRecord[]>
-  remove(childSessionId: string): Promise<void>
+  remove(jobId: string): Promise<void>
 }
 
 function createInMemoryStore(): JobStore {
@@ -14,19 +14,19 @@ function createInMemoryStore(): JobStore {
 
   return {
     async save(record: JobRecord): Promise<void> {
-      map.set(record.childSessionId, record)
+      map.set(record.jobId, record)
     },
 
-    async get(childSessionId: string): Promise<JobRecord | undefined> {
-      return map.get(childSessionId)
+    async get(jobId: string): Promise<JobRecord | undefined> {
+      return map.get(jobId)
     },
 
     async list(): Promise<JobRecord[]> {
       return Array.from(map.values())
     },
 
-    async remove(childSessionId: string): Promise<void> {
-      map.delete(childSessionId)
+    async remove(jobId: string): Promise<void> {
+      map.delete(jobId)
     },
   }
 }
@@ -34,19 +34,19 @@ function createInMemoryStore(): JobStore {
 function createFileBackedStore(stateDir: string): JobStore {
   const ensureDir = () => mkdir(stateDir, { recursive: true })
 
-  function filePath(childSessionId: string): string {
-    return join(stateDir, `${childSessionId}.json`)
+  function filePath(jobId: string): string {
+    return join(stateDir, `${encodeURIComponent(jobId)}.json`)
   }
 
   return {
     async save(record: JobRecord): Promise<void> {
       await ensureDir()
-      await writeFile(filePath(record.childSessionId), JSON.stringify(record, null, 2), "utf-8")
+      await writeFile(filePath(record.jobId), JSON.stringify(record, null, 2), "utf-8")
     },
 
-    async get(childSessionId: string): Promise<JobRecord | undefined> {
+    async get(jobId: string): Promise<JobRecord | undefined> {
       try {
-        const content = await readFile(filePath(childSessionId), "utf-8")
+        const content = await readFile(filePath(jobId), "utf-8")
         return JSON.parse(content) as JobRecord
       } catch (err: unknown) {
         if (isNodeError(err) && err.code === "ENOENT") {
@@ -81,9 +81,9 @@ function createFileBackedStore(stateDir: string): JobStore {
       return jobs
     },
 
-    async remove(childSessionId: string): Promise<void> {
+    async remove(jobId: string): Promise<void> {
       try {
-        await unlink(filePath(childSessionId))
+        await unlink(filePath(jobId))
       } catch (err: unknown) {
         if (isNodeError(err) && err.code === "ENOENT") {
           return
