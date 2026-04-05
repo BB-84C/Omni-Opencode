@@ -127,7 +127,7 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     const transcript = createTranscript()
 
     while (true) {
-      const current = await store.get(record.jobId)
+      const current = await getJobRecord(record.jobId)
       if (!current || current.status !== "running") {
         return
       }
@@ -135,14 +135,22 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
       const output = await runtimeSelection.runtime.read(record.runtimeHandle)
       if (output.data) {
         appendTranscriptChunk(transcript, output.data)
+        const latest = await getJobRecord(record.jobId)
+        if (!latest || latest.status !== "running") {
+          return
+        }
 
-        await saveJobRecord(withTranscriptProgress(current, transcript))
+        await saveJobRecord(withTranscriptProgress(latest, transcript))
       }
 
       const snapshot = await runtimeSelection.runtime.snapshot()
       const runtimeJob = snapshot.jobs.find((job) => job.id === record.runtimeHandle)
 
       if (!runtimeJob) {
+        const latest = await getJobRecord(record.jobId)
+        if (!latest || latest.status !== "running") {
+          return
+        }
         const summary = `Runtime job ${record.runtimeHandle} disappeared before completion could be confirmed.`
         const content = formatCompletionUpdate({
           backend: record.backend ?? "codex",
@@ -156,7 +164,7 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           content,
         })
         await saveFinalStateAfterParentUpdate(withCleanup({
-          ...current,
+          ...latest,
           status: "failed",
           summary,
           lastProjectedMessage: content,
@@ -165,6 +173,10 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
       }
 
       if (runtimeJob.status === "stopped") {
+        const latest = await getJobRecord(record.jobId)
+        if (!latest || latest.status !== "running") {
+          return
+        }
         const report = extractFinalReport(transcript)
         const summary = report.summary ?? "Runtime completed without a structured summary."
         const content = formatCompletionUpdate({
@@ -174,7 +186,7 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           summary,
         })
         const completedRecord = withCleanup({
-          ...withTranscriptProgress(current, transcript),
+          ...withTranscriptProgress(latest, transcript),
           status: "completed",
           summary,
           changedFiles: report.changedFiles,
@@ -227,6 +239,11 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
   }
 
   async function saveJobRecord(record: StoredJobRecord): Promise<void> {
+    const overlaid = finalStateOverlay.get(record.jobId)
+    if (overlaid && overlaid.status !== "running" && record.status === "running") {
+      return
+    }
+
     await store.save(record)
 
     if (finalStateOverlay.has(record.jobId)) {
@@ -396,7 +413,10 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           if (job.status !== "running")
             return `Delegated job ${jobId} is not running (status: ${job.status})`
           await runtimeSelection.runtime.stop(job.runtimeHandle)
-          await saveJobRecord(withCleanup({ ...job, status: "interrupted" }, "cancelled"))
+          const interruptedJob = withCleanup({ ...job, status: "interrupted" }, "cancelled")
+          finalStateOverlay.set(jobId, interruptedJob)
+          await writeOverlayRecord(finalStateOverlayDir, interruptedJob)
+          await saveJobRecord(interruptedJob)
           return `Cancelled delegated job ${jobId}`
         },
       }),

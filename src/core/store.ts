@@ -1,5 +1,6 @@
-import { readFile, writeFile, mkdir, readdir, unlink } from "fs/promises"
+import { readFile, writeFile, mkdir, readdir, unlink, rename } from "fs/promises"
 import { join } from "path"
+import { randomUUID } from "crypto"
 import type { JobRecord } from "./jobs.js"
 
 export interface JobStore {
@@ -41,7 +42,10 @@ function createFileBackedStore(stateDir: string): JobStore {
   return {
     async save(record: JobRecord): Promise<void> {
       await ensureDir()
-      await writeFile(filePath(record.jobId), JSON.stringify(record, null, 2), "utf-8")
+      const finalPath = filePath(record.jobId)
+      const tempPath = `${finalPath}.tmp-${process.pid}-${Date.now()}-${randomUUID()}`
+      await writeFile(tempPath, JSON.stringify(record, null, 2), "utf-8")
+      await rename(tempPath, finalPath)
     },
 
     async get(jobId: string): Promise<JobRecord | undefined> {
