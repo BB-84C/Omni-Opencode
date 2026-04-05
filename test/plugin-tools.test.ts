@@ -21,6 +21,12 @@ function makeMockClient(): OpenCodeClient {
 
 function makeJob(overrides: Partial<JobRecord> = {}): JobRecord {
   return {
+    jobId: "parent-session-1:job-1",
+    parentSessionId: "parent-session-1",
+    runtimeType: "tmux",
+    runtimeHandle: "runtime-handle-1",
+    attachTarget: "runtime-handle-1",
+    terminalLogPath: "logs/job-1.log",
     childSessionId: "child-session-1",
     backend: "codex",
     status: "running",
@@ -47,8 +53,8 @@ describe("delegatedJobsList", () => {
 
   it("returns all jobs from the store with mapped fields", async () => {
     const ctx = await makeContext([
-      makeJob({ childSessionId: "child-1", backend: "codex", status: "running", resumable: true }),
-      makeJob({ childSessionId: "child-2", backend: "claude-code", status: "interrupted", resumable: false }),
+      makeJob({ jobId: "parent-session-1:job-1", childSessionId: "child-1", backend: "codex", status: "running", resumable: true }),
+      makeJob({ jobId: "parent-session-1:job-2", childSessionId: "child-2", backend: "claude-code", status: "interrupted", resumable: false }),
     ])
 
     const result = await delegatedJobsList(ctx)
@@ -62,7 +68,7 @@ describe("delegatedJobsList", () => {
   })
 
   it("defaults resumable to false when not set", async () => {
-    const ctx = await makeContext([makeJob({ childSessionId: "child-1" })])
+    const ctx = await makeContext([makeJob({ jobId: "parent-session-1:job-1", childSessionId: "child-1" })])
     const result = await delegatedJobsList(ctx)
     expect(result.jobs[0]!.resumable).toBe(false)
   })
@@ -70,11 +76,13 @@ describe("delegatedJobsList", () => {
 
 describe("delegatedJobSnapshot", () => {
   it("returns snapshot merged with store data", async () => {
+    const jobId = "parent-session-1:snap-job"
     const adapter = new FakeAdapter()
     const handle = await adapter.startJob({ childSessionId: "child-snap", prompt: "do work" })
 
     const store = createJobStore()
     await store.save(makeJob({
+      jobId,
       childSessionId: "child-snap",
       backend: "codex",
       status: "running",
@@ -83,9 +91,9 @@ describe("delegatedJobSnapshot", () => {
     }))
 
     const ctx: ToolContext = { store, adapter, sessionManager: createSessionManager(makeMockClient()) }
-    const result = await delegatedJobSnapshot(ctx, "child-snap")
+    const result = await delegatedJobSnapshot(ctx, jobId)
 
-    expect(result.childSessionId).toBe("child-snap")
+    expect(result.childSessionId).toBe(jobId)
     expect(result.status).toBe("running")
     expect(result.changedFiles).toEqual([])
     expect(typeof result.lastEventSeq).toBe("number")
@@ -100,11 +108,13 @@ describe("delegatedJobSnapshot", () => {
 
 describe("delegatedJobCancel", () => {
   it("calls adapter.cancelJob and updates store status to interrupted", async () => {
+    const jobId = "parent-session-1:cancel-job"
     const adapter = new FakeAdapter()
     const handle = await adapter.startJob({ childSessionId: "child-cancel", prompt: "do work" })
 
     const store = createJobStore()
     await store.save(makeJob({
+      jobId,
       childSessionId: "child-cancel",
       backend: "codex",
       status: "running",
@@ -113,23 +123,24 @@ describe("delegatedJobCancel", () => {
 
     const cancelSpy = vi.spyOn(adapter, "cancelJob")
     const ctx: ToolContext = { store, adapter, sessionManager: createSessionManager(makeMockClient()) }
-    const result = await delegatedJobCancel(ctx, "child-cancel")
+    const result = await delegatedJobCancel(ctx, jobId)
 
     expect(result.cancelled).toBe(true)
     expect(cancelSpy).toHaveBeenCalledOnce()
     expect(cancelSpy).toHaveBeenCalledWith(handle.id)
 
-    const updatedJob = await store.get("child-cancel")
+    const updatedJob = await store.get(jobId)
     expect(updatedJob?.status).toBe("interrupted")
   })
 
   it("uses childSessionId as fallback when backendThreadId is not set", async () => {
+    const jobId = "parent-session-1:noid-job"
     const adapter = new FakeAdapter()
-    // Start a job with the childSessionId as the ID so cancelJob won't throw
-    const handle = await adapter.startJob({ childSessionId: "child-noid", prompt: "do work" })
+    await adapter.startJob({ childSessionId: "child-noid", prompt: "do work" })
 
     const store = createJobStore()
     await store.save(makeJob({
+      jobId,
       childSessionId: "child-noid",
       backend: "codex",
       status: "running",
@@ -138,10 +149,10 @@ describe("delegatedJobCancel", () => {
 
     const cancelSpy = vi.spyOn(adapter, "cancelJob").mockResolvedValue(undefined)
     const ctx: ToolContext = { store, adapter, sessionManager: createSessionManager(makeMockClient()) }
-    const result = await delegatedJobCancel(ctx, "child-noid")
+    const result = await delegatedJobCancel(ctx, jobId)
 
     expect(result.cancelled).toBe(true)
-    expect(cancelSpy).toHaveBeenCalledWith("child-noid")
+    expect(cancelSpy).toHaveBeenCalledWith(jobId)
   })
 
   it("throws when job not found in store", async () => {

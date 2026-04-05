@@ -6,12 +6,13 @@ import { createJobStore } from "../src/core/store.js"
 import type { JobRecord } from "../src/core/jobs.js"
 
 const sampleJob: JobRecord = {
-  childSessionId: "session-abc123",
-  backend: "codex",
+  jobId: "job-abc123",
+  parentSessionId: "session-parent-1",
+  runtimeType: "tmux",
+  runtimeHandle: "runtime-handle-1",
+  attachTarget: "runtime-handle-1",
+  terminalLogPath: ".opencode/logs/job-abc123.terminal.log",
   status: "running",
-  brokerJobId: "broker-1",
-  backendThreadId: "thread-1",
-  resumeToken: "token-xyz",
   resumable: true,
   changedFiles: ["src/index.ts"],
   lastCheckpointAt: 1700000000000,
@@ -24,13 +25,29 @@ describe("createJobStore (in-memory)", () => {
   it("save + get roundtrip", async () => {
     const store = createJobStore()
     await store.save(sampleJob)
-    const retrieved = await store.get(sampleJob.childSessionId)
+    const retrieved = await store.get(sampleJob.jobId)
     expect(retrieved).toEqual(sampleJob)
+  })
+
+  it("stores the parent-session job shape", async () => {
+    const store = createJobStore()
+    await store.save(sampleJob)
+
+    const retrieved = await store.get(sampleJob.jobId)
+
+    expect(retrieved).toMatchObject({
+      jobId: sampleJob.jobId,
+      parentSessionId: sampleJob.parentSessionId,
+      runtimeType: sampleJob.runtimeType,
+      runtimeHandle: sampleJob.runtimeHandle,
+      attachTarget: sampleJob.attachTarget,
+      terminalLogPath: sampleJob.terminalLogPath,
+    })
   })
 
   it("list returns all saved jobs", async () => {
     const store = createJobStore()
-    const job2: JobRecord = { ...sampleJob, childSessionId: "session-def456", backend: "claude-code" }
+    const job2: JobRecord = { ...sampleJob, jobId: "job-def456", runtimeType: "pty", runtimeHandle: "runtime-handle-2", attachTarget: "runtime-handle-2" }
     await store.save(sampleJob)
     await store.save(job2)
     const all = await store.list()
@@ -41,14 +58,14 @@ describe("createJobStore (in-memory)", () => {
   it("remove deletes a job", async () => {
     const store = createJobStore()
     await store.save(sampleJob)
-    await store.remove(sampleJob.childSessionId)
-    const retrieved = await store.get(sampleJob.childSessionId)
+    await store.remove(sampleJob.jobId)
+    const retrieved = await store.get(sampleJob.jobId)
     expect(retrieved).toBeUndefined()
   })
 
   it("get on missing key returns undefined", async () => {
     const store = createJobStore()
-    const result = await store.get("nonexistent-session")
+    const result = await store.get("nonexistent-job")
     expect(result).toBeUndefined()
   })
 })
@@ -64,13 +81,29 @@ describe("createJobStore (file-backed persistence)", () => {
   it("save + get roundtrip with file persistence", async () => {
     const store = createJobStore(stateDir)
     await store.save(sampleJob)
-    const retrieved = await store.get(sampleJob.childSessionId)
+    const retrieved = await store.get(sampleJob.jobId)
     expect(retrieved).toEqual(sampleJob)
+  })
+
+  it("persists the parent-session job shape to disk", async () => {
+    const store = createJobStore(stateDir)
+    await store.save(sampleJob)
+
+    const retrieved = await store.get(sampleJob.jobId)
+
+    expect(retrieved).toMatchObject({
+      jobId: sampleJob.jobId,
+      parentSessionId: sampleJob.parentSessionId,
+      runtimeType: sampleJob.runtimeType,
+      runtimeHandle: sampleJob.runtimeHandle,
+      attachTarget: sampleJob.attachTarget,
+      terminalLogPath: sampleJob.terminalLogPath,
+    })
   })
 
   it("list returns all saved jobs with file persistence", async () => {
     const store = createJobStore(stateDir)
-    const job2: JobRecord = { ...sampleJob, childSessionId: "session-def456", backend: "claude-code" }
+    const job2: JobRecord = { ...sampleJob, jobId: "job-def456", runtimeType: "pty", runtimeHandle: "runtime-handle-2", attachTarget: "runtime-handle-2" }
     await store.save(sampleJob)
     await store.save(job2)
     const all = await store.list()
@@ -81,14 +114,14 @@ describe("createJobStore (file-backed persistence)", () => {
   it("remove deletes a job with file persistence", async () => {
     const store = createJobStore(stateDir)
     await store.save(sampleJob)
-    await store.remove(sampleJob.childSessionId)
-    const retrieved = await store.get(sampleJob.childSessionId)
+    await store.remove(sampleJob.jobId)
+    const retrieved = await store.get(sampleJob.jobId)
     expect(retrieved).toBeUndefined()
   })
 
   it("get on missing key returns undefined with file persistence", async () => {
     const store = createJobStore(stateDir)
-    const result = await store.get("nonexistent-session")
+    const result = await store.get("nonexistent-job")
     expect(result).toBeUndefined()
   })
 
@@ -98,7 +131,7 @@ describe("createJobStore (file-backed persistence)", () => {
 
     // Create a fresh store instance pointing at the same directory
     const store2 = createJobStore(stateDir)
-    const retrieved = await store2.get(sampleJob.childSessionId)
+    const retrieved = await store2.get(sampleJob.jobId)
     expect(retrieved).toEqual(sampleJob)
   })
 })

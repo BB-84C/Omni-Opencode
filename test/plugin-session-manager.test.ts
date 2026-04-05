@@ -27,7 +27,7 @@ describe("createSessionManager", () => {
       parentSessionId: "parent-123",
       title: "Fix the tests",
       backend: "codex",
-      brokerJobId: "broker-job-1",
+      brokerJobId: "parent-123:job-1",
       cwd: "/workspace",
     })
 
@@ -38,7 +38,7 @@ describe("createSessionManager", () => {
       title: "Fix the tests",
       metadata: {
         backend: "codex",
-        brokerJobId: "broker-job-1",
+        brokerJobId: "parent-123:job-1",
         cwd: "/workspace",
       },
     })

@@ -25,8 +25,8 @@ export async function delegatedJobsList(ctx: ToolContext): Promise<DelegatedJobs
   const records = await ctx.store.list()
   return {
     jobs: records.map((job) => ({
-      childSessionId: job.childSessionId,
-      backend: job.backend,
+      childSessionId: job.childSessionId ?? job.jobId,
+      backend: job.backend ?? "unknown",
       status: job.status,
       resumable: job.resumable ?? false,
     })),
