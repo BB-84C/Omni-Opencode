@@ -7,3 +7,7 @@ dist/
 coverage/
 .broker-state/
 *.log
+/.claude
+CLAUDE.md
+/.opencode
+opencode.json

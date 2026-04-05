@@ -14,4 +14,6 @@ export type JobRecord = {
   lastEventSeq?: number
   activeCommand?: string
   activeTool?: string
+  lastProjectedMessage?: string  // last text written to child session
+  summary?: string               // final result summary from result.final event
 }
