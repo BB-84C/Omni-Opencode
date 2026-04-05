@@ -11,3 +11,4 @@ coverage/
 CLAUDE.md
 /.opencode
 opencode.json
+config.json
