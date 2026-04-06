@@ -90,9 +90,14 @@ describe("parent-facing delegation tools", () => {
     )
     const result = JSON.parse(output) as {
       jobId: string
+      batchId: string
       parentSessionId: string
       backend: string
       status: string
+      attachCommand: string
+      monitorTarget: string
+      autoOpenAttempted: boolean
+      autoOpenSucceeded: boolean
       monitor: {
         id: string
         attach: { mode: string; target: string }
@@ -107,9 +112,14 @@ describe("parent-facing delegation tools", () => {
     expect(result).toEqual({
       jobId: "parent-session-1:claude-job-1",
       parentSessionId: "parent-session-1",
+      batchId: "parent-session-1",
       backend: "claude-code",
       status: "running",
       monitor: {
+      attachCommand: "attached claude-job-1",
+      monitorTarget: "claude-job-1-pty",
+      autoOpenAttempted: true,
+      autoOpenSucceeded: true,
         id: "claude-job-1-monitor",
         attach: { mode: "pty", target: "claude-job-1-pty" },
         launch: {

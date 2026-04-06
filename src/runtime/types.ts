@@ -19,6 +19,8 @@ export type RuntimeMonitor = {
   id: string
   attach: RuntimeAttachMetadata
   launch: RuntimeLaunchMetadata
+  attachCommand?: string
+  logTailCommand?: string
 }
 
 export type RuntimeJob = {

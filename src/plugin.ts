@@ -101,10 +101,19 @@ function withCleanup(record: StoredJobRecord, reason: CleanupReason): StoredJobR
 
 type DelegationLaunchResult = {
   jobId: string
+  batchId: string
   parentSessionId: string
   backend: Backend
   status: "running"
+  attachCommand: string
+  monitorTarget: string
+  autoOpenAttempted: boolean
+  autoOpenSucceeded: boolean
   monitor: RuntimeMonitor
+}
+
+function monitorAttachCommand(monitor: RuntimeMonitor): string {
+  return monitor.attachCommand ?? monitor.launch.command
 }
 
 type ParentSessionMessageClient = PluginInput["client"] & {
@@ -296,9 +305,14 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     const result: DelegationLaunchResult = {
       jobId: record.jobId,
       parentSessionId,
+      batchId: record.batchId ?? parentSessionId,
       backend,
       status: "running",
       monitor,
+      attachCommand: monitorAttachCommand(monitor),
+      monitorTarget: monitor.attach.target,
+      autoOpenAttempted: runtimeSelection.autoOpenMonitor,
+      autoOpenSucceeded: started.monitor !== undefined,
     }
 
     void monitorDelegationCompletion(record).catch((error) => recordMonitorCrash(record, error))
