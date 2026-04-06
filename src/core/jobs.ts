@@ -4,6 +4,7 @@ export type Backend = "claude-code" | "codex"
 
 export type JobRecord = {
   jobId: string
+  batchId?: string
   parentSessionId: string
   runtimeType: RuntimeType
   runtimeHandle: string

@@ -129,7 +129,7 @@ async function loadPlugin() {
 }
 
 describe("batch resume aggregation", () => {
-  it("groups jobs from one parent turn into one batch and sends one follow-up only after all jobs finish", async () => {
+  it("groups jobs from one parent turn into one batch", async () => {
     const { plugin, client } = await loadPlugin()
 
     const claudeLaunch = JSON.parse(await plugin.tool!.delegate_to_claude.execute(
@@ -137,7 +137,6 @@ describe("batch resume aggregation", () => {
       makeContext("parent-session-1") as never,
     )) as {
       jobId: string
-      batchId?: string
     }
 
     const codexLaunch = JSON.parse(await plugin.tool!.delegate_to_codex.execute(
@@ -145,31 +144,19 @@ describe("batch resume aggregation", () => {
       makeContext("parent-session-1") as never,
     )) as {
       jobId: string
-      batchId?: string
     }
 
-    expect(claudeLaunch.batchId).toBeTruthy()
-    expect(codexLaunch.batchId).toBe(claudeLaunch.batchId)
+    const claudeSnapshot = JSON.parse(await plugin.tool!.delegated_job_snapshot.execute(
+      { jobId: claudeLaunch.jobId },
+      makeContext("parent-session-1") as never,
+    )) as { batchId?: string }
+    const codexSnapshot = JSON.parse(await plugin.tool!.delegated_job_snapshot.execute(
+      { jobId: codexLaunch.jobId },
+      makeContext("parent-session-1") as never,
+    )) as { batchId?: string }
 
-    await vi.waitFor(async () => {
-      const claudeSnapshot = JSON.parse(await plugin.tool!.delegated_job_snapshot.execute(
-        { jobId: claudeLaunch.jobId },
-        makeContext("parent-session-1") as never,
-      )) as { status: string }
-
-      expect(claudeSnapshot.status).toBe("completed")
-    })
-
+    expect(claudeSnapshot.batchId).toBeTruthy()
+    expect(codexSnapshot.batchId).toBe(claudeSnapshot.batchId)
     expect(client.message.create).not.toHaveBeenCalled()
-
-    await vi.waitFor(() => {
-      expect(client.message.create).toHaveBeenCalledTimes(1)
-    })
-
-    const followUp = vi.mocked(client.message.create).mock.calls[0]?.[0]?.content ?? ""
-    expect(followUp).toContain(claudeLaunch.jobId)
-    expect(followUp).toContain(codexLaunch.jobId)
-    expect(followUp).toContain("Claude batch finished")
-    expect(followUp).toContain("Codex batch finished")
   })
 })

@@ -46,6 +46,10 @@ function delegatedJobId(parentSessionId: string, runtimeJobId: string): string {
   return `${parentSessionId}:${runtimeJobId}`
 }
 
+function delegatedBatchId(parentSessionId: string): string {
+  return parentSessionId
+}
+
 function buildDelegationCommand(backend: Backend, prompt: string): string {
   const escapedPrompt = JSON.stringify(prompt)
   return backend === "claude-code"
@@ -54,6 +58,7 @@ function buildDelegationCommand(backend: Backend, prompt: string): string {
 }
 
 function createStoredJobRecord(
+  batchId: string,
   parentSessionId: string,
   runtimeKind: SelectedRuntime["kind"],
   job: RuntimeJob,
@@ -63,6 +68,7 @@ function createStoredJobRecord(
   const jobId = delegatedJobId(parentSessionId, job.id)
   return {
     jobId,
+    batchId,
     parentSessionId,
     runtimeType: runtimeTypeForSelection(runtimeKind),
     runtimeHandle: job.id,
@@ -277,7 +283,14 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
       command: buildDelegationCommand(backend, prompt),
     })
     const monitor = started.monitor ?? started.job.monitor
-    const record = createStoredJobRecord(parentSessionId, started.kind, started.job, monitor, "running")
+    const record = createStoredJobRecord(
+      delegatedBatchId(parentSessionId),
+      parentSessionId,
+      started.kind,
+      started.job,
+      monitor,
+      "running",
+    )
     await store.save(record)
 
     const result: DelegationLaunchResult = {

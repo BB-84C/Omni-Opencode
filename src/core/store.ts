@@ -7,6 +7,7 @@ export interface JobStore {
   save(record: JobRecord): Promise<void>
   get(jobId: string): Promise<JobRecord | undefined>
   list(): Promise<JobRecord[]>
+  listByBatch(batchId: string): Promise<JobRecord[]>
   remove(jobId: string): Promise<void>
 }
 
@@ -24,6 +25,10 @@ function createInMemoryStore(): JobStore {
 
     async list(): Promise<JobRecord[]> {
       return Array.from(map.values())
+    },
+
+    async listByBatch(batchId: string): Promise<JobRecord[]> {
+      return Array.from(map.values()).filter((record) => record.batchId === batchId)
     },
 
     async remove(jobId: string): Promise<void> {
@@ -83,6 +88,11 @@ function createFileBackedStore(stateDir: string): JobStore {
         }
       }
       return jobs
+    },
+
+    async listByBatch(batchId: string): Promise<JobRecord[]> {
+      const jobs = await this.list()
+      return jobs.filter((record) => record.batchId === batchId)
     },
 
     async remove(jobId: string): Promise<void> {

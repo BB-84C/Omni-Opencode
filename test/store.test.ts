@@ -21,6 +21,28 @@ const sampleJob: JobRecord = {
   activeTool: "str_replace",
 }
 
+const sampleBatchJob = {
+  ...sampleJob,
+  jobId: "job-batch-1",
+  batchId: "batch-parent-1",
+} as JobRecord & { batchId: string }
+
+const secondBatchJob = {
+  ...sampleJob,
+  jobId: "job-batch-2",
+  runtimeHandle: "runtime-handle-2",
+  attachTarget: "runtime-handle-2",
+  batchId: "batch-parent-1",
+} as JobRecord & { batchId: string }
+
+const otherBatchJob = {
+  ...sampleJob,
+  jobId: "job-batch-3",
+  runtimeHandle: "runtime-handle-3",
+  attachTarget: "runtime-handle-3",
+  batchId: "batch-parent-2",
+} as JobRecord & { batchId: string }
+
 describe("createJobStore (in-memory)", () => {
   it("save + get roundtrip", async () => {
     const store = createJobStore()
@@ -67,6 +89,23 @@ describe("createJobStore (in-memory)", () => {
     const store = createJobStore()
     const result = await store.get("nonexistent-job")
     expect(result).toBeUndefined()
+  })
+
+  it("persists batch identity and returns only jobs from the requested batch", async () => {
+    const store = createJobStore() as ReturnType<typeof createJobStore> & {
+      listByBatch(batchId: string): Promise<JobRecord[]>
+    }
+
+    await store.save(sampleBatchJob)
+    await store.save(secondBatchJob)
+    await store.save(otherBatchJob)
+
+    const retrieved = await store.get(sampleBatchJob.jobId) as JobRecord & { batchId?: string }
+    const batchJobs = await store.listByBatch("batch-parent-1")
+
+    expect(retrieved.batchId).toBe("batch-parent-1")
+    expect(batchJobs).toEqual(expect.arrayContaining([sampleBatchJob, secondBatchJob]))
+    expect(batchJobs).not.toEqual(expect.arrayContaining([otherBatchJob]))
   })
 })
 
@@ -133,5 +172,24 @@ describe("createJobStore (file-backed persistence)", () => {
     const store2 = createJobStore(stateDir)
     const retrieved = await store2.get(sampleJob.jobId)
     expect(retrieved).toEqual(sampleJob)
+  })
+
+  it("persists batch membership across store instances", async () => {
+    const store1 = createJobStore(stateDir) as ReturnType<typeof createJobStore> & {
+      listByBatch(batchId: string): Promise<JobRecord[]>
+    }
+    await store1.save(sampleBatchJob)
+    await store1.save(secondBatchJob)
+    await store1.save(otherBatchJob)
+
+    const store2 = createJobStore(stateDir) as ReturnType<typeof createJobStore> & {
+      listByBatch(batchId: string): Promise<JobRecord[]>
+    }
+    const retrieved = await store2.get(sampleBatchJob.jobId) as JobRecord & { batchId?: string }
+    const batchJobs = await store2.listByBatch("batch-parent-1")
+
+    expect(retrieved.batchId).toBe("batch-parent-1")
+    expect(batchJobs).toEqual(expect.arrayContaining([sampleBatchJob, secondBatchJob]))
+    expect(batchJobs).not.toEqual(expect.arrayContaining([otherBatchJob]))
   })
 })
