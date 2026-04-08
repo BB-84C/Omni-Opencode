@@ -1,3 +1,5 @@
+import { mkdir, writeFile } from "node:fs/promises"
+import { join } from "node:path"
 import { describe, expect, it, vi } from "vitest"
 
 function uniqueStateDir(name: string): string {
@@ -20,9 +22,11 @@ function makeContext(sessionID: string) {
 type LoadPluginOptions = {
   directory?: string
   omitMessageCreate?: boolean
+  omitPromptAsync?: boolean
   rejectMessageCreate?: boolean
   rejectRuntimeRead?: boolean
   rejectCompletedSave?: boolean
+  readOutputByJobId?: Record<string, string[]>
   snapshotJobs?: Array<{
     id: string
     backend: "claude-code" | "codex"
@@ -38,6 +42,19 @@ type LoadPluginOptions = {
 
 async function loadPlugin(options: LoadPluginOptions = {}) {
   vi.resetModules()
+  const directory = options.directory ?? uniqueStateDir("completion-reporting")
+  const transcriptCaptureTarget = join(directory, ".omni-monitors", "claude-job-1.log").replace(/\\/g, "/")
+
+  const readOutputByJobId = new Map(
+    Object.entries(options.readOutputByJobId ?? {
+      "claude-job-1": [JSON.stringify({
+        finalReport: {
+          summary: "Patched PTY completion reporting",
+          changedFiles: ["src/plugin.ts", "test/completion-reporting.test.ts"],
+        },
+      })],
+    }),
+  )
 
   if (options.rejectCompletedSave) {
     const records = new Map<string, Record<string, unknown>>()
@@ -75,13 +92,8 @@ async function loadPlugin(options: LoadPluginOptions = {}) {
       ? vi.fn(async () => {
           throw new Error("runtime read failed")
         })
-      : vi.fn(async () => ({
-          data: JSON.stringify({
-            finalReport: {
-              summary: "Patched PTY completion reporting",
-              changedFiles: ["src/plugin.ts", "test/completion-reporting.test.ts"],
-            },
-          }),
+      : vi.fn(async (jobId: string) => ({
+          data: readOutputByJobId.get(jobId)?.shift() ?? "",
         })),
     stop: vi.fn(async () => undefined),
     snapshot: vi.fn(async () => {
@@ -97,9 +109,12 @@ async function loadPlugin(options: LoadPluginOptions = {}) {
                 command: 'claude --print "report back"',
                 status: "running" as const,
                 monitor: {
-                  id: "claude-job-1-monitor",
-                  attach: { mode: "pty" as const, target: "claude-job-1-pty" },
-                  launch: { command: "attached claude-job-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
+                  id: "monitor-parent-session-1",
+                  sessionId: "parent-session-1",
+                  attach: { mode: "pty" as const, target: "parent-session-1:dashboard" },
+                  attachCommand: "psmux attach -t parent-session-1",
+                  transcriptCaptureTarget,
+                  launch: { command: "psmux attach -t parent-session-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
                 },
               }],
         }
@@ -112,23 +127,29 @@ async function loadPlugin(options: LoadPluginOptions = {}) {
           command: "claude --print \"report back\"",
           status: snapshotCalls >= 2 ? "stopped" as const : "running" as const,
           monitor: {
-            id: "claude-job-1-monitor",
-            attach: { mode: "pty" as const, target: "claude-job-1-pty" },
-            launch: { command: "attached claude-job-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
+            id: "monitor-parent-session-1",
+            sessionId: "parent-session-1",
+            attach: { mode: "pty" as const, target: "parent-session-1:dashboard" },
+            attachCommand: "psmux attach -t parent-session-1",
+            transcriptCaptureTarget,
+            launch: { command: "psmux attach -t parent-session-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
           },
         }],
       }
     }),
     openMonitor: vi.fn(async (jobId: string) => ({
-      id: `${jobId}-monitor`,
-      attach: { mode: "pty" as const, target: `${jobId}-pty` },
-      launch: { command: `attached ${jobId}`, cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
+      id: "monitor-parent-session-1",
+      sessionId: "parent-session-1",
+      attach: { mode: "pty" as const, target: "parent-session-1:dashboard" },
+      attachCommand: "psmux attach -t parent-session-1",
+      transcriptCaptureTarget: join(directory, ".omni-monitors", `${jobId}.log`).replace(/\\/g, "/"),
+      launch: { command: "psmux attach -t parent-session-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
     })),
   }
 
   vi.doMock("../src/runtime/select-runtime.js", () => ({
     selectRuntime: () => ({
-      kind: "windows-pty" as const,
+      kind: "windows-psmux" as const,
       runtime,
       autoOpenMonitor: true,
       start: async (params: { backend: "claude-code" | "codex"; command: string }) => {
@@ -143,7 +164,7 @@ async function loadPlugin(options: LoadPluginOptions = {}) {
   const client = {
     session: {
       create: vi.fn(),
-      promptAsync: vi.fn(),
+      ...(options.omitPromptAsync ? {} : { promptAsync: vi.fn() }),
     },
     ...(options.omitMessageCreate
       ? {}
@@ -157,14 +178,14 @@ async function loadPlugin(options: LoadPluginOptions = {}) {
   }
   const plugin = await OmniOpencodePlugin({
     client: client as never,
-    directory: options.directory ?? uniqueStateDir("completion-reporting"),
+    directory,
   } as never)
 
-  return { plugin, client, runtime }
+  return { plugin, client, runtime, directory, transcriptCaptureTarget }
 }
 
 describe("completion reporting", () => {
-  it("posts a concise parent-session update when a runtime completes", async () => {
+  it("posts one aggregate user follow-up with inspection references when a batch completes", async () => {
     const { plugin, client } = await loadPlugin()
 
     await plugin.tool!.delegate_to_claude.execute(
@@ -175,19 +196,24 @@ describe("completion reporting", () => {
     await vi.waitFor(() => {
       expect(client.message!.create).toHaveBeenCalledWith({
         sessionId: "parent-session-1",
-        role: "assistant",
-        content: expect.stringContaining("parent-session-1:claude-job-1"),
+        role: "user",
+        content: expect.stringContaining("parent-session-1:message-1"),
       })
     })
 
     expect(client.session.promptAsync).not.toHaveBeenCalled()
 
     const completionUpdate = vi.mocked(client.message!.create).mock.calls[0]?.[0]?.content
+    expect(vi.mocked(client.message!.create)).toHaveBeenCalledTimes(1)
+    expect(completionUpdate).toContain("parent-session-1:message-1")
     expect(completionUpdate).toContain("claude-code")
     expect(completionUpdate).toContain("parent-session-1:claude-job-1")
     expect(completionUpdate).toContain("completed")
     expect(completionUpdate).toContain("Patched PTY completion reporting")
-    expect(completionUpdate).toContain("Full report available")
+    expect(completionUpdate).toContain("delegated_job_snapshot")
+    expect(completionUpdate).toContain("delegated_job_read")
+    expect(completionUpdate).toContain("delegated_job_attach")
+    expect(completionUpdate).toContain("psmux attach -t parent-session-1")
 
     const snapshot = await plugin.tool!.delegated_job_snapshot.execute(
       { jobId: "parent-session-1:claude-job-1" },
@@ -199,10 +225,32 @@ describe("completion reporting", () => {
     expect(snapshot).toContain('"changedFiles": [')
   })
 
-  it("requires the supported parent-session write path", async () => {
-    await expect(loadPlugin({ omitMessageCreate: true })).rejects.toThrow(
-      "Parent session message.create is required for completion reporting",
+  it("falls back to session.promptAsync when message.create is unavailable", async () => {
+    const { plugin, client } = await loadPlugin({ omitMessageCreate: true })
+
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "report back" },
+      makeContext("parent-session-1") as never,
     )
+
+    await vi.waitFor(async () => {
+      const snapshot = await plugin.tool!.delegated_job_snapshot.execute(
+        { jobId: "parent-session-1:claude-job-1" },
+        makeContext("parent-session-1") as never,
+      )
+
+      expect(snapshot).toContain('"status": "completed"')
+      expect(snapshot).toContain('"summary": "Patched PTY completion reporting"')
+    })
+
+    expect(client.session.promptAsync).toHaveBeenCalledWith({
+      path: { id: "parent-session-1" },
+      body: {
+        parts: [{ type: "text", text: expect.stringContaining("parent-session-1:message-1") }],
+      },
+      query: { directory: expect.stringContaining("completion-reporting") },
+    })
+    expect("message" in client).toBe(false)
   })
 
   it("marks the delegated job failed when the runtime disappears from snapshot", async () => {
@@ -216,14 +264,15 @@ describe("completion reporting", () => {
     await vi.waitFor(() => {
       expect(client.message!.create).toHaveBeenCalledWith({
         sessionId: "parent-session-1",
-        role: "assistant",
+        role: "user",
         content: expect.stringContaining("failed"),
       })
     })
 
     const completionUpdate = vi.mocked(client.message!.create).mock.calls[0]?.[0]?.content
+    expect(completionUpdate).toContain("parent-session-1:message-1")
     expect(completionUpdate).toContain("failed")
-    expect(completionUpdate).not.toContain("completed")
+    expect(completionUpdate).toContain("delegated_job_snapshot")
 
     const snapshot = await plugin.tool!.delegated_job_snapshot.execute(
       { jobId: "parent-session-1:claude-job-1" },
@@ -233,7 +282,7 @@ describe("completion reporting", () => {
     expect(snapshot).toContain('"status": "failed"')
   })
 
-  it("records a monitor crash instead of persisting a successful final state when the parent-session update fails", async () => {
+  it("keeps the completed job state when the aggregate follow-up injection fails", async () => {
     const { plugin, client } = await loadPlugin({ rejectMessageCreate: true })
 
     await plugin.tool!.delegate_to_claude.execute(
@@ -250,9 +299,28 @@ describe("completion reporting", () => {
       makeContext("parent-session-1") as never,
     )
 
-    expect(snapshot).toContain('"status": "failed"')
-    expect(snapshot).toContain('Background completion monitor crashed: message write failed')
-    expect(snapshot).not.toContain('"summary": "Patched PTY completion reporting"')
+    expect(snapshot).toContain('"status": "completed"')
+    expect(snapshot).toContain('"summary": "Patched PTY completion reporting"')
+    expect(snapshot).toContain('aggregate follow-up could not be injected: message write failed')
+  })
+
+  it("records an explicit reporting failure when no parent session reporting api is available", async () => {
+    const { plugin } = await loadPlugin({ omitMessageCreate: true, omitPromptAsync: true })
+
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "report back" },
+      makeContext("parent-session-1") as never,
+    )
+
+    await vi.waitFor(async () => {
+      const snapshot = await plugin.tool!.delegated_job_snapshot.execute(
+        { jobId: "parent-session-1:claude-job-1" },
+        makeContext("parent-session-1") as never,
+      )
+
+      expect(snapshot).toContain('aggregate follow-up could not be injected: no parent session reporting api is available')
+      expect(snapshot).toContain('"status": "completed"')
+    })
   })
 
   it("persists an explicit failure signal when the background monitor crashes", async () => {
@@ -287,7 +355,7 @@ describe("completion reporting", () => {
     await vi.waitFor(() => {
       expect(client.message!.create).toHaveBeenCalledWith({
         sessionId: "parent-session-1",
-        role: "assistant",
+        role: "user",
         content: expect.stringContaining("completed"),
       })
     })
@@ -320,5 +388,61 @@ describe("completion reporting", () => {
     expect(reloadedSnapshot).toContain('"status": "completed"')
     expect(reloadedSnapshot).toContain('"summary": "Patched PTY completion reporting"')
     expect(reloadedListedJobs).toContain('parent-session-1:claude-job-1 [claude-code] status=completed')
+  })
+
+  it("reads completed psmux transcript output from the persisted capture path after reload", async () => {
+    const finalReport = JSON.stringify({
+      finalReport: {
+        summary: "Patched PTY completion reporting",
+        changedFiles: ["src/plugin.ts", "test/completion-reporting.test.ts"],
+      },
+    })
+    const followUp = "follow-up transcript chunk\n"
+    const directory = uniqueStateDir("completion-reporting-psmux-reload")
+    const { plugin, client, transcriptCaptureTarget } = await loadPlugin({
+      directory,
+      readOutputByJobId: {
+        "claude-job-1": [finalReport, followUp],
+      },
+    })
+
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "report back" },
+      makeContext("parent-session-1") as never,
+    )
+
+    await vi.waitFor(() => {
+      expect(client.message!.create).toHaveBeenCalledWith({
+        sessionId: "parent-session-1",
+        role: "user",
+        content: expect.stringContaining("completed"),
+      })
+    })
+
+    const snapshot = await plugin.tool!.delegated_job_snapshot.execute(
+      { jobId: "parent-session-1:claude-job-1" },
+      makeContext("parent-session-1") as never,
+    )
+    const readOutput = await plugin.tool!.delegated_job_read.execute(
+      { jobId: "parent-session-1:claude-job-1" },
+      makeContext("parent-session-1") as never,
+    )
+
+    expect(snapshot).toContain('"status": "completed"')
+    expect(snapshot).toContain('"summary": "Patched PTY completion reporting"')
+    expect(snapshot).toContain(`"transcriptCaptureTarget": "${transcriptCaptureTarget}"`)
+
+    await mkdir(join(directory, ".omni-monitors"), { recursive: true })
+    await writeFile(transcriptCaptureTarget, `${finalReport}\n${followUp}__OMNI_OPENCODE_PSMUX_EXIT__:0\n`, "utf8")
+
+    const reloaded = await loadPlugin({ directory, readOutputByJobId: { "claude-job-1": [] } })
+    const reloadedReadOutput = await reloaded.plugin.tool!.delegated_job_read.execute(
+      { jobId: "parent-session-1:claude-job-1" },
+      makeContext("parent-session-1") as never,
+    )
+
+    expect(reloadedReadOutput).toContain('"summary":"Patched PTY completion reporting"')
+    expect(reloadedReadOutput).toContain(followUp)
+    expect(reloadedReadOutput).not.toContain("__OMNI_OPENCODE_PSMUX_EXIT__")
   })
 })

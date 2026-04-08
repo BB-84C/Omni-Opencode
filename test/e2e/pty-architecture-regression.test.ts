@@ -52,6 +52,54 @@ async function loadPlugin() {
   vi.doMock("../../src/adapters/codex-adapter.js", () => ({
     createCodexAdapter: () => codexAdapter,
   }))
+  vi.doMock("../../src/runtime/windows-psmux-managed.js", async () => {
+    const actual = await vi.importActual<typeof import("../../src/runtime/windows-psmux-managed.js")>("../../src/runtime/windows-psmux-managed.js")
+
+    return {
+      ...actual,
+      ensureManagedWindowsPsmuxInstalled: vi.fn(async () => ({
+        binaryPath: "D:/Omni-Opencode/.omni-tools/psmux/3.3.1/win32-x64/psmux.exe",
+        manifestPath: "D:/Omni-Opencode/.omni-tools/psmux/manifest.json",
+        installed: false,
+      })),
+    }
+  })
+  vi.doMock("../../src/runtime/select-runtime.js", () => {
+    const runtime = {
+      start: vi.fn(async (_params?: unknown) => ({
+        id: 'job-1',
+        backend: 'codex',
+        command: 'codex run',
+        status: 'running',
+        monitor: {
+          id: 'monitor-parent-session-1',
+          sessionId: 'parent-session-1',
+          attach: { mode: 'pty' as const, target: 'parent-session-1:dashboard' },
+          attachCommand: 'psmux attach -t parent-session-1',
+          launch: { command: 'psmux attach -t parent-session-1' },
+        },
+      })),
+      read: vi.fn(async () => ({ data: '' })),
+      stop: vi.fn(async () => undefined),
+      snapshot: vi.fn(async () => ({ jobs: [] })),
+      openMonitor: vi.fn(async (_lookup?: unknown) => ({
+        id: 'monitor-parent-session-1',
+        sessionId: 'parent-session-1',
+        attach: { mode: 'pty' as const, target: 'parent-session-1:dashboard' },
+        attachCommand: 'psmux attach -t parent-session-1',
+        launch: { command: 'psmux attach -t parent-session-1' },
+      })),
+    }
+
+    return {
+      selectRuntime: () => ({
+        kind: 'windows-psmux' as const,
+        runtime,
+        autoOpenMonitor: true,
+        start: vi.fn(async (params: any) => ({ job: await runtime.start(params), monitor: await runtime.openMonitor({ type: 'job', jobId: 'job-1' }) })),
+      }),
+    }
+  })
 
   const { OmniOpencodePlugin } = await import("../../src/plugin.js")
   const plugin = await OmniOpencodePlugin({

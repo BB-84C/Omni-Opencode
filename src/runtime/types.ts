@@ -1,8 +1,17 @@
 export type RuntimeBackend = "claude-code" | "codex"
 
+export type RuntimeKind = "windows-psmux" | "windows-pty" | "tmux"
+
+export const ARCHIVED_RUNTIME_KINDS = ["windows-pty"] as const
+
+export type ArchivedRuntimeKind = (typeof ARCHIVED_RUNTIME_KINDS)[number]
+
+export type PrimaryRuntimeKind = Exclude<RuntimeKind, ArchivedRuntimeKind>
+
 export type RuntimeStartParams = {
   backend: RuntimeBackend
   command: string
+  monitorSessionId?: string
 }
 
 export type RuntimeLaunchMetadata = {
@@ -13,14 +22,24 @@ export type RuntimeLaunchMetadata = {
 export type RuntimeAttachMetadata = {
   mode: "pty" | "tmux"
   target: string
+  windowIndex?: number
+}
+
+export type RuntimeWindowMetadata = {
+  target: string
+  index?: number
 }
 
 export type RuntimeMonitor = {
   id: string
+  sessionId?: string
   attach: RuntimeAttachMetadata
+  window?: RuntimeWindowMetadata
   launch: RuntimeLaunchMetadata
+  autoOpenSucceeded?: boolean
   attachCommand?: string
   logTailCommand?: string
+  transcriptCaptureTarget?: string
 }
 
 export type RuntimeJob = {
@@ -39,10 +58,14 @@ export type RuntimeSnapshot = {
   jobs: RuntimeJob[]
 }
 
+export type RuntimeMonitorLookup =
+  | { type: "job"; jobId: string }
+  | { type: "shared-session"; monitorSessionId: string }
+
 export interface Runtime {
   start(params: RuntimeStartParams): Promise<RuntimeJob>
   read(jobId: string): Promise<RuntimeReadResult>
   stop(jobId: string): Promise<void>
   snapshot(): Promise<RuntimeSnapshot>
-  openMonitor(jobId: string): Promise<RuntimeMonitor>
+  openMonitor(lookup: RuntimeMonitorLookup): Promise<RuntimeMonitor>
 }

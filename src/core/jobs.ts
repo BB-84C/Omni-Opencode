@@ -6,13 +6,21 @@ export type JobRecord = {
   jobId: string
   batchId?: string
   parentSessionId: string
+  parentMessageId?: string
+  monitorSessionId?: string
+  runtimeKind?: "windows-psmux" | "windows-pty" | "tmux"
   runtimeType: RuntimeType
   runtimeHandle: string
   attachTarget: string
+  attachCommand?: string
+  logTailCommand?: string
   terminalLogPath: string
+  transcriptCaptureTarget?: string
   transcriptByteLength?: number
   transcriptChunkCount?: number
   status: JobStatus
+  autoOpenAttempted?: boolean
+  autoOpenSucceeded?: boolean
   resumable?: boolean
   changedFiles?: string[]
   lastCheckpointAt?: number  // epoch ms

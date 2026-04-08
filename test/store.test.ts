@@ -43,6 +43,47 @@ const otherBatchJob = {
   batchId: "batch-parent-2",
 } as JobRecord & { batchId: string }
 
+const sharedMonitorJob = {
+  ...sampleJob,
+  parentSessionId: "parent-session-1",
+  monitorSessionId: "parent-session-1",
+  attachTarget: "monitor-session-parent-1",
+  attachCommand: 'node "D:\\Omni-Opencode\\dist\\runtime\\windows-multiplexer.js" attach --session "parent-session-1"',
+  logTailCommand: 'Get-Content -Path "monitor-session-parent-1" -Wait',
+  terminalLogPath: "monitor-session-parent-1",
+} as JobRecord & { monitorSessionId: string }
+
+const laterSharedMonitorJob = {
+  ...sharedMonitorJob,
+  jobId: "job-shared-2",
+  runtimeHandle: "runtime-handle-2",
+  backendThreadId: "runtime-handle-2",
+  attachTarget: "monitor-session-parent-1-conflict",
+  attachCommand: 'node "D:\\Omni-Opencode\\dist\\runtime\\windows-multiplexer.js" attach --session "parent-session-1-conflict"',
+  terminalLogPath: "monitor-session-parent-1-conflict",
+} as JobRecord & { monitorSessionId: string }
+
+const thirdSharedMonitorJob = {
+  ...sharedMonitorJob,
+  jobId: "job-shared-3",
+  runtimeHandle: "runtime-handle-3",
+  backendThreadId: "runtime-handle-3",
+} as JobRecord & { monitorSessionId: string }
+
+const canonicalResavedSharedMonitorJob = {
+  ...sharedMonitorJob,
+  attachTarget: "monitor-session-parent-1-redefined",
+  attachCommand: 'node "D:\\Omni-Opencode\\dist\\runtime\\windows-multiplexer.js" attach --session "parent-session-1-redefined"',
+  logTailCommand: 'Get-Content -Path "monitor-session-parent-1-redefined" -Wait',
+  terminalLogPath: "monitor-session-parent-1-redefined",
+} as JobRecord & { monitorSessionId: string }
+
+const laterSharedMonitorJobWithoutOptionalCommands = {
+  ...laterSharedMonitorJob,
+  attachCommand: undefined,
+  logTailCommand: undefined,
+} as JobRecord & { monitorSessionId: string }
+
 describe("createJobStore (in-memory)", () => {
   it("save + get roundtrip", async () => {
     const store = createJobStore()
@@ -106,6 +147,21 @@ describe("createJobStore (in-memory)", () => {
     expect(retrieved.batchId).toBe("batch-parent-1")
     expect(batchJobs).toEqual(expect.arrayContaining([sampleBatchJob, secondBatchJob]))
     expect(batchJobs).not.toEqual(expect.arrayContaining([otherBatchJob]))
+  })
+
+  it("stores monitor session identity and session-scoped attach metadata", async () => {
+    const store = createJobStore()
+    await store.save(sharedMonitorJob)
+
+    const retrieved = await store.get(sharedMonitorJob.jobId) as (JobRecord & { monitorSessionId?: string }) | undefined
+
+    expect(retrieved).toMatchObject({
+      jobId: sharedMonitorJob.jobId,
+      parentSessionId: "parent-session-1",
+      monitorSessionId: "parent-session-1",
+      attachTarget: "monitor-session-parent-1",
+      attachCommand: sharedMonitorJob.attachCommand,
+    })
   })
 })
 
@@ -191,5 +247,100 @@ describe("createJobStore (file-backed persistence)", () => {
     expect(retrieved.batchId).toBe("batch-parent-1")
     expect(batchJobs).toEqual(expect.arrayContaining([sampleBatchJob, secondBatchJob]))
     expect(batchJobs).not.toEqual(expect.arrayContaining([otherBatchJob]))
+  })
+
+  it("preserves stable shared monitor metadata when a later job in the same session conflicts", async () => {
+    const store1 = createJobStore(stateDir)
+    await store1.save(sharedMonitorJob)
+    await store1.save(laterSharedMonitorJob)
+
+    const store2 = createJobStore(stateDir)
+    const firstRetrieved = await store2.get(sharedMonitorJob.jobId) as (JobRecord & { monitorSessionId?: string }) | undefined
+    const secondRetrieved = await store2.get(laterSharedMonitorJob.jobId) as (JobRecord & { monitorSessionId?: string }) | undefined
+
+    expect(firstRetrieved).toMatchObject({
+      parentSessionId: "parent-session-1",
+      monitorSessionId: "parent-session-1",
+      attachTarget: "monitor-session-parent-1",
+      attachCommand: sharedMonitorJob.attachCommand,
+    })
+    expect(secondRetrieved).toMatchObject({
+      parentSessionId: "parent-session-1",
+      monitorSessionId: "parent-session-1",
+      attachTarget: "monitor-session-parent-1",
+      attachCommand: sharedMonitorJob.attachCommand,
+      terminalLogPath: "monitor-session-parent-1",
+    })
+  })
+
+  it("chooses shared monitor metadata deterministically when conflicting records already exist", async () => {
+    const store1 = createJobStore(stateDir)
+    await store1.save(laterSharedMonitorJob)
+    await store1.save(sharedMonitorJob)
+    await store1.save(thirdSharedMonitorJob)
+
+    const store2 = createJobStore(stateDir)
+    const retrieved = await store2.get(thirdSharedMonitorJob.jobId) as (JobRecord & { monitorSessionId?: string }) | undefined
+
+    expect(retrieved).toMatchObject({
+      parentSessionId: "parent-session-1",
+      monitorSessionId: "parent-session-1",
+      attachTarget: "monitor-session-parent-1",
+      attachCommand: sharedMonitorJob.attachCommand,
+      terminalLogPath: "monitor-session-parent-1",
+    })
+  })
+
+  it("repairs earlier conflicting records after canonical shared monitor metadata is known", async () => {
+    const store1 = createJobStore(stateDir)
+    await store1.save(laterSharedMonitorJob)
+    await store1.save(sharedMonitorJob)
+
+    const store2 = createJobStore(stateDir)
+    const repairedEarlierRecord = await store2.get(laterSharedMonitorJob.jobId) as (JobRecord & { monitorSessionId?: string }) | undefined
+
+    expect(repairedEarlierRecord).toMatchObject({
+      parentSessionId: "parent-session-1",
+      monitorSessionId: "parent-session-1",
+      attachTarget: "monitor-session-parent-1",
+      attachCommand: sharedMonitorJob.attachCommand,
+      terminalLogPath: "monitor-session-parent-1",
+    })
+  })
+
+  it("preserves canonical shared monitor metadata when the canonical record is re-saved with conflicting values", async () => {
+    const store1 = createJobStore(stateDir)
+    await store1.save(sharedMonitorJob)
+    await store1.save(canonicalResavedSharedMonitorJob)
+
+    const store2 = createJobStore(stateDir)
+    const canonicalRecord = await store2.get(sharedMonitorJob.jobId) as (JobRecord & { monitorSessionId?: string }) | undefined
+
+    expect(canonicalRecord).toMatchObject({
+      parentSessionId: "parent-session-1",
+      monitorSessionId: "parent-session-1",
+      attachTarget: "monitor-session-parent-1",
+      attachCommand: sharedMonitorJob.attachCommand,
+      logTailCommand: sharedMonitorJob.logTailCommand,
+      terminalLogPath: "monitor-session-parent-1",
+    })
+  })
+
+  it("keeps optional shared monitor commands stable across all records in the session", async () => {
+    const store1 = createJobStore(stateDir)
+    await store1.save(sharedMonitorJob)
+    await store1.save(laterSharedMonitorJobWithoutOptionalCommands)
+
+    const store2 = createJobStore(stateDir)
+    const retrieved = await store2.get(laterSharedMonitorJobWithoutOptionalCommands.jobId) as (JobRecord & { monitorSessionId?: string }) | undefined
+
+    expect(retrieved).toMatchObject({
+      parentSessionId: "parent-session-1",
+      monitorSessionId: "parent-session-1",
+      attachTarget: "monitor-session-parent-1",
+      attachCommand: sharedMonitorJob.attachCommand,
+      logTailCommand: sharedMonitorJob.logTailCommand,
+      terminalLogPath: "monitor-session-parent-1",
+    })
   })
 })

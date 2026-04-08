@@ -5,7 +5,8 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && tsc -p tsconfig.scripts.json",
+    "bootstrap:windows-psmux": "node ./scripts/windows-psmux-bootstrap.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"

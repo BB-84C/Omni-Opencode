@@ -1,0 +1,70 @@
+export const WINDOWS_PSMUX_MANAGED_VERSION: "3.3.1"
+
+export type ResolveManagedWindowsPsmuxPathsOptions = {
+  cwd?: string
+  version?: string
+  platform?: NodeJS.Platform
+  arch?: string
+}
+
+export type ManagedWindowsPsmuxPaths = {
+  cacheRoot: string
+  manifestPath: string
+  versionRoot: string
+  platformCacheRoot: string
+  binaryPath: string
+}
+
+export type ManagedWindowsPsmuxManifest = {
+  version: string
+  platform: NodeJS.Platform
+  arch: string
+  binaryPath: string
+  installedAt: string
+}
+
+export type EnsureManagedWindowsPsmuxInstalledOptions = ResolveManagedWindowsPsmuxPathsOptions & {
+  releaseUrl?: string
+  fileExists?: (path: string) => Promise<boolean> | boolean
+  runPowerShellCommand?: (command: string) => Promise<void> | void
+  execFile?: (
+    command: string,
+    args: string[],
+    options?: { windowsHide?: boolean },
+  ) => Promise<{ stdout?: string; stderr?: string }> | { stdout?: string; stderr?: string }
+  download?: (params: {
+    version: string
+    platform: NodeJS.Platform
+    arch: string
+    releaseUrl?: string
+    destinationPath: string
+    paths: ManagedWindowsPsmuxPaths
+  }) => Promise<string | void> | string | void
+  extract?: (params: {
+    archivePath: string
+    destinationPath: string
+    version: string
+    platform: NodeJS.Platform
+    arch: string
+    releaseUrl?: string
+    paths: ManagedWindowsPsmuxPaths
+  }) => Promise<string | void> | string | void
+  verify?: (binaryPath: string, paths: ManagedWindowsPsmuxPaths) => Promise<void> | void
+  mkdir?: (path: string, options?: { recursive?: boolean }) => Promise<void> | void
+  writeFile?: (path: string, data: string, encoding: BufferEncoding) => Promise<void> | void
+  now?: () => string
+}
+
+export type ManagedWindowsPsmuxInstallResult = {
+  binaryPath: string
+  manifestPath: string
+  installed: boolean
+}
+
+export function resolveManagedWindowsPsmuxPaths(
+  options?: ResolveManagedWindowsPsmuxPathsOptions,
+): ManagedWindowsPsmuxPaths
+
+export function ensureManagedWindowsPsmuxInstalled(
+  options?: EnsureManagedWindowsPsmuxInstalledOptions,
+): Promise<ManagedWindowsPsmuxInstallResult>

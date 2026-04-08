@@ -2,6 +2,7 @@ import type {
   Runtime,
   RuntimeJob,
   RuntimeMonitor,
+  RuntimeMonitorLookup,
   RuntimeReadResult,
   RuntimeSnapshot,
   RuntimeStartParams,
@@ -49,8 +50,12 @@ export function createFakeRuntime(): Runtime {
       return { jobs: [...jobs.values()] }
     },
 
-    async openMonitor(jobId: string): Promise<RuntimeMonitor> {
-      const job = getJob(jobs, jobId)
+    async openMonitor(lookup: RuntimeMonitorLookup): Promise<RuntimeMonitor> {
+      if (lookup.type !== "job") {
+        throw new Error(`Unknown runtime job: ${lookup.monitorSessionId}`)
+      }
+
+      const job = getJob(jobs, lookup.jobId)
       return job.monitor
     },
   }

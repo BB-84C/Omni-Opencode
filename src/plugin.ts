@@ -6,7 +6,7 @@ import type { Backend, JobRecord } from "./core/jobs.js"
 import { extractFinalReport } from "./runtime/extract-report.js"
 import { selectRuntime, type SelectRuntimeOptions, type SelectedRuntime } from "./runtime/select-runtime.js"
 import { appendTranscriptChunk, createTranscript } from "./runtime/transcript.js"
-import type { RuntimeJob, RuntimeMonitor, RuntimeStartParams } from "./runtime/types.js"
+import type { RuntimeJob, RuntimeMonitor, RuntimeMonitorLookup, RuntimeStartParams } from "./runtime/types.js"
 
 type CleanupState = "completed"
 type CleanupReason = "cancelled" | "completed" | "failed"
@@ -46,39 +46,56 @@ function delegatedJobId(parentSessionId: string, runtimeJobId: string): string {
   return `${parentSessionId}:${runtimeJobId}`
 }
 
-function delegatedBatchId(parentSessionId: string): string {
-  return parentSessionId
+function turnKey(parentSessionId: string, parentMessageId: string): string {
+  return `${parentSessionId}:${parentMessageId}`
+}
+
+function delegatedBatchId(parentSessionId: string, parentMessageId: string): string {
+  return turnKey(parentSessionId, parentMessageId)
 }
 
 function buildDelegationCommand(backend: Backend, prompt: string): string {
   const escapedPrompt = JSON.stringify(prompt)
   return backend === "claude-code"
     ? `claude --print ${escapedPrompt}`
-    : `codex ${escapedPrompt}`
+    : `codex exec --color never ${escapedPrompt}`
 }
 
-function createStoredJobRecord(
+export function createStoredJobRecord(
   batchId: string,
   parentSessionId: string,
+  parentMessageId: string,
   runtimeKind: SelectedRuntime["kind"],
   job: RuntimeJob,
   monitor: RuntimeMonitor,
   status: JobRecord["status"],
+  autoOpenAttempted: boolean,
+  autoOpenSucceeded: boolean,
 ): StoredJobRecord {
   const jobId = delegatedJobId(parentSessionId, job.id)
+  const monitorSessionId = monitor.sessionId ?? parentSessionId
+  const transcriptCaptureTarget = job.monitor.transcriptCaptureTarget ?? monitor.transcriptCaptureTarget
   return {
     jobId,
     batchId,
     parentSessionId,
+    parentMessageId,
+    monitorSessionId,
+    runtimeKind,
     runtimeType: runtimeTypeForSelection(runtimeKind),
     runtimeHandle: job.id,
-    attachTarget: monitor.attach.target,
-    terminalLogPath: monitor.attach.target,
+    attachTarget: monitorNavigationTarget(monitor),
+    attachCommand: monitorAttachCommand(monitor),
+    logTailCommand: monitor.logTailCommand,
+    terminalLogPath: transcriptCaptureTarget ?? monitorNavigationTarget(monitor),
+    transcriptCaptureTarget,
     transcriptByteLength: 0,
     transcriptChunkCount: 0,
     backend: job.backend,
     backendThreadId: job.id,
     status,
+    autoOpenAttempted,
+    autoOpenSucceeded,
   }
 }
 
@@ -103,6 +120,7 @@ type DelegationLaunchResult = {
   jobId: string
   batchId: string
   parentSessionId: string
+  monitorSessionId: string
   backend: Backend
   status: "running"
   attachCommand: string
@@ -116,8 +134,62 @@ function monitorAttachCommand(monitor: RuntimeMonitor): string {
   return monitor.attachCommand ?? monitor.launch.command
 }
 
+function monitorNavigationTarget(monitor: RuntimeMonitor): string {
+  return monitor.window?.target ?? monitor.attach.target
+}
+
+function monitorLookupForJob(job: StoredJobRecord): RuntimeMonitorLookup {
+  if (job.status === "running") {
+    return { type: "job", jobId: job.runtimeHandle }
+  }
+
+  return usesWindowsPsmuxSharedSession(job)
+    ? { type: "shared-session", monitorSessionId: job.monitorSessionId ?? job.parentSessionId }
+    : { type: "job", jobId: job.runtimeHandle }
+}
+
+function usesWindowsPsmuxSharedSession(job: StoredJobRecord): boolean {
+  if (job.runtimeKind !== undefined) {
+    return job.runtimeKind === "windows-psmux"
+      && typeof job.monitorSessionId === "string"
+      && job.monitorSessionId.length > 0
+  }
+
+  return job.runtimeType === "pty"
+    && typeof job.monitorSessionId === "string"
+    && job.monitorSessionId.length > 0
+    && (job.attachCommand?.startsWith("psmux attach -t ") === true || job.attachTarget.endsWith(":dashboard"))
+}
+
+function didAutoOpenMonitorSucceed(params: {
+  kind: SelectedRuntime["kind"]
+  autoOpenMonitor: boolean
+  startedMonitor: RuntimeMonitor | undefined
+}): boolean {
+  if (!params.autoOpenMonitor || !params.startedMonitor) {
+    return false
+  }
+
+  if (params.kind === "windows-psmux") {
+    return params.startedMonitor.autoOpenSucceeded === true
+  }
+
+  return true
+}
+
+function isTerminalJob(record: StoredJobRecord): boolean {
+  return record.status !== "running"
+}
+
 type ParentSessionMessageClient = PluginInput["client"] & {
-  message: {
+  session?: PluginInput["client"]["session"] & {
+    promptAsync?(params: {
+      path: { id: string }
+      body: { parts: Array<{ type: "text"; text: string }> }
+      query?: { directory?: string }
+    }): Promise<void>
+  }
+  message?: {
     create(params: {
       sessionId: string
       role: string
@@ -125,6 +197,8 @@ type ParentSessionMessageClient = PluginInput["client"] & {
     }): Promise<void>
   }
 }
+
+export const id = "omni-opencode"
 
 export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginInput) => {
   const stateDir = `${directory}/.broker-state`
@@ -134,8 +208,114 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
   const runtimeSelection = createPluginRuntimeSelection()
   const messageClient = client as ParentSessionMessageClient
 
-  if (typeof messageClient.message?.create !== "function") {
-    throw new Error("Parent session message.create is required for completion reporting")
+  const canReportToParent =
+    typeof messageClient.message?.create === "function" ||
+    typeof messageClient.session?.promptAsync === "function"
+  const delegationRequiredTurns = new Set<string>()
+  const delegationLaunchedTurns = new Set<string>()
+  const reportedBatchIds = new Set<string>()
+  const reportingBatchIds = new Set<string>()
+  const transcriptByJobId = new Map<string, string>()
+  const transcriptReadOffsets = new Map<string, number>()
+
+  async function listJobRecordsByBatch(batchId: string): Promise<StoredJobRecord[]> {
+    return (await listJobRecords()).filter((job) => job.batchId === batchId)
+  }
+
+  function formatBatchCompletionUpdate(batchId: string, jobs: StoredJobRecord[]): string {
+    const header = `Delegated batch ${batchId} finished. ${jobs.length} job(s) reached terminal status.`
+    const details = jobs
+      .map((job) => {
+        const inspectionRefs = [
+          `delegated_job_snapshot({\"jobId\":\"${job.jobId}\"})`,
+          `delegated_job_read({\"jobId\":\"${job.jobId}\"})`,
+          `delegated_job_attach({\"jobId\":\"${job.jobId}\"})`,
+          job.attachCommand ? `attach: ${job.attachCommand}` : null,
+          job.logTailCommand ? `log tail: ${job.logTailCommand}` : null,
+        ].filter(Boolean).join(" | ")
+
+        const autoOpen = job.autoOpenAttempted
+          ? (job.autoOpenSucceeded ? "auto-opened" : "auto-open failed")
+          : "auto-open not attempted"
+
+        return [
+          `- ${job.jobId} [${job.backend}] ${job.status}: ${job.summary ?? "No structured summary."}`,
+          `  monitor=${autoOpen}`,
+          `  inspect: ${inspectionRefs}`,
+        ].join("\n")
+      })
+      .join("\n")
+
+    return `${header}\n${details}`
+  }
+
+  async function markBatchReported(batchId: string, content: string): Promise<void> {
+    const jobs = await listJobRecordsByBatch(batchId)
+
+    await Promise.all(jobs.map((job) => saveFinalStateAfterParentUpdate({
+      ...job,
+      lastProjectedMessage: content,
+    })))
+  }
+
+  async function maybeReportBatchCompletion(batchId: string | undefined): Promise<void> {
+    if (!batchId || reportedBatchIds.has(batchId) || reportingBatchIds.has(batchId)) {
+      return
+    }
+
+    const jobs = await listJobRecordsByBatch(batchId)
+    if (jobs.length === 0 || jobs.some((job) => !isTerminalJob(job))) {
+      return
+    }
+
+    reportingBatchIds.add(batchId)
+    try {
+      const completedJobs = await listJobRecordsByBatch(batchId)
+      if (completedJobs.length === 0 || completedJobs.some((job) => !isTerminalJob(job))) {
+        return
+      }
+
+      const content = formatBatchCompletionUpdate(batchId, completedJobs)
+      if (!canReportToParent) {
+        const failureContent = `Delegated batch ${batchId} finished, but the aggregate follow-up could not be injected: no parent session reporting api is available`
+        reportedBatchIds.add(batchId)
+        await markBatchReported(batchId, failureContent)
+        return
+      }
+
+      await reportBatchToParentSession(completedJobs[0]!.parentSessionId, content)
+
+      reportedBatchIds.add(batchId)
+      await markBatchReported(batchId, content)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      const content = `Delegated batch ${batchId} finished, but the aggregate follow-up could not be injected: ${detail}`
+      reportedBatchIds.add(batchId)
+      await markBatchReported(batchId, content)
+    } finally {
+      reportingBatchIds.delete(batchId)
+    }
+  }
+
+  async function reportBatchToParentSession(parentSessionId: string, content: string): Promise<void> {
+    if (typeof messageClient.message?.create === "function") {
+      await messageClient.message.create({
+        sessionId: parentSessionId,
+        role: "user",
+        content,
+      })
+      return
+    }
+
+    if (typeof messageClient.session?.promptAsync === "function") {
+      await messageClient.session.promptAsync({
+        path: { id: parentSessionId },
+        body: {
+          parts: [{ type: "text", text: content }],
+        },
+        query: { directory },
+      })
+    }
   }
 
   async function monitorDelegationCompletion(record: StoredJobRecord): Promise<void> {
@@ -150,6 +330,7 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
       const output = await runtimeSelection.runtime.read(record.runtimeHandle)
       if (output.data) {
         appendTranscriptChunk(transcript, output.data)
+        transcriptByJobId.set(record.jobId, transcript.text)
         const latest = await getJobRecord(record.jobId)
         if (!latest || latest.status !== "running") {
           return
@@ -167,23 +348,12 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           return
         }
         const summary = `Runtime job ${record.runtimeHandle} disappeared before completion could be confirmed.`
-        const content = formatCompletionUpdate({
-          backend: record.backend ?? "codex",
-          jobId: record.jobId,
-          status: "failed",
-          summary,
-        })
-        await messageClient.message.create({
-          sessionId: record.parentSessionId,
-          role: "assistant",
-          content,
-        })
         await saveFinalStateAfterParentUpdate(withCleanup({
           ...latest,
           status: "failed",
           summary,
-          lastProjectedMessage: content,
         }, "failed"))
+        await maybeReportBatchCompletion(latest.batchId)
         return
       }
 
@@ -194,26 +364,14 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
         }
         const report = extractFinalReport(transcript)
         const summary = report.summary ?? "Runtime completed without a structured summary."
-        const content = formatCompletionUpdate({
-          backend: record.backend ?? "codex",
-          jobId: record.jobId,
-          status: "completed",
-          summary,
-        })
         const completedRecord = withCleanup({
           ...withTranscriptProgress(latest, transcript),
           status: "completed",
           summary,
           changedFiles: report.changedFiles,
-          lastProjectedMessage: content,
         }, "completed")
-
-        await messageClient.message.create({
-          sessionId: record.parentSessionId,
-          role: "assistant",
-          content,
-        })
         await saveFinalStateAfterParentUpdate(completedRecord)
+        await maybeReportBatchCompletion(completedRecord.batchId)
         return
       }
 
@@ -231,14 +389,15 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     const detail = error instanceof Error ? error.message : String(error)
     const summary = `Background completion monitor crashed: ${detail}`
 
-    await store.save(withCleanup({
+    const failedRecord = withCleanup({
       ...current,
       status: "failed",
       summary,
       lastProjectedMessage: summary,
-    }, "failed"))
-    finalStateOverlay.delete(record.jobId)
-    await deleteOverlayRecord(finalStateOverlayDir, record.jobId)
+    }, "failed")
+
+    await saveFinalStateAfterParentUpdate(failedRecord)
+    await maybeReportBatchCompletion(failedRecord.batchId)
   }
 
   async function saveFinalStateAfterParentUpdate(record: StoredJobRecord): Promise<void> {
@@ -271,6 +430,35 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     return (finalStateOverlay.get(jobId) ?? await store.get(jobId)) as StoredJobRecord | undefined
   }
 
+  async function readCompletedTranscript(job: StoredJobRecord): Promise<string | undefined> {
+    const transcript = transcriptByJobId.get(job.jobId)
+    if (transcript !== undefined) {
+      const offset = transcriptReadOffsets.get(job.jobId) ?? 0
+      const unread = transcript.slice(offset)
+      transcriptReadOffsets.set(job.jobId, transcript.length)
+      return unread
+    }
+
+    if (!job.transcriptCaptureTarget) {
+      return undefined
+    }
+
+    try {
+      const persistedTranscript = await readFile(job.transcriptCaptureTarget, "utf-8")
+      const readableTranscript = stripPsmuxExitMarkers(persistedTranscript)
+      const offset = transcriptReadOffsets.get(job.jobId) ?? 0
+      const unread = readableTranscript.slice(offset)
+      transcriptReadOffsets.set(job.jobId, readableTranscript.length)
+      return unread
+    } catch (error) {
+      if (isMissingFileError(error)) {
+        return undefined
+      }
+
+      throw error
+    }
+  }
+
   async function listJobRecords(): Promise<StoredJobRecord[]> {
     const jobs = await store.list()
     const merged = new Map(jobs.map(job => [job.jobId, job]))
@@ -284,35 +472,46 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
 
   async function launchDelegation(
     parentSessionId: string,
+    parentMessageId: string,
     backend: Backend,
     prompt: string,
   ): Promise<string> {
     const started = await preparePluginRuntimeStart(runtimeSelection, {
       backend,
       command: buildDelegationCommand(backend, prompt),
+      monitorSessionId: parentSessionId,
     })
     const monitor = started.monitor ?? started.job.monitor
+    const autoOpenSucceeded = didAutoOpenMonitorSucceed({
+      kind: started.kind,
+      autoOpenMonitor: runtimeSelection.autoOpenMonitor,
+      startedMonitor: started.monitor,
+    })
     const record = createStoredJobRecord(
-      delegatedBatchId(parentSessionId),
+      delegatedBatchId(parentSessionId, parentMessageId),
       parentSessionId,
+      parentMessageId,
       started.kind,
       started.job,
       monitor,
       "running",
+      runtimeSelection.autoOpenMonitor,
+      autoOpenSucceeded,
     )
     await store.save(record)
 
     const result: DelegationLaunchResult = {
       jobId: record.jobId,
+      batchId: record.batchId ?? delegatedBatchId(parentSessionId, parentMessageId),
       parentSessionId,
-      batchId: record.batchId ?? parentSessionId,
+      monitorSessionId: record.monitorSessionId ?? parentSessionId,
       backend,
       status: "running",
-      monitor,
       attachCommand: monitorAttachCommand(monitor),
       monitorTarget: monitor.attach.target,
       autoOpenAttempted: runtimeSelection.autoOpenMonitor,
-      autoOpenSucceeded: started.monitor !== undefined,
+      autoOpenSucceeded,
+      monitor,
     }
 
     void monitorDelegationCompletion(record).catch((error) => recordMonitorCrash(record, error))
@@ -321,26 +520,119 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
   }
 
   return {
+    "experimental.chat.messages.transform": async (_input, output) => {
+      const latestUser = [...output.messages]
+        .reverse()
+        .find(message => message.info.role === "user")
+
+      if (!latestUser) {
+        return
+      }
+
+      const text = latestUser.parts
+        .filter(part => part.type === "text" && typeof (part as { text?: unknown }).text === "string")
+        .map(part => (part as { text: string }).text)
+        .join("\n")
+        .toLowerCase()
+
+      const asksForClaude = text.includes("claude code") || text.includes("delegate_to_claude")
+      const asksForCodex = text.includes("codex") || text.includes("delegate_to_codex")
+      const asksForDelegation = text.includes("delegate") || text.includes("delegation")
+
+      if (asksForDelegation && (asksForClaude || asksForCodex)) {
+        delegationRequiredTurns.add(turnKey(latestUser.info.sessionID, latestUser.info.id))
+      }
+    },
+    "permission.ask": async (input, output) => {
+      const blockedDelegationSubstitutes = new Set([
+        "task",
+        "webfetch",
+        "websearch",
+        "codesearch",
+        "read",
+        "glob",
+        "grep",
+        "chrome-devtools_new_page",
+        "chrome-devtools_take_snapshot",
+        "chrome-devtools_click",
+        "playwright_browser_navigate",
+        "playwright_browser_snapshot",
+        "playwright_browser_run_code",
+      ])
+
+      const blockedAfterLaunch = new Set([
+        ...blockedDelegationSubstitutes,
+        "bash",
+        "delegated_jobs_list",
+        "delegated_job_snapshot",
+        "delegated_job_read",
+        "delegated_job_attach",
+      ])
+
+      const currentTurn = turnKey(input.sessionID, input.messageID)
+      if (delegationLaunchedTurns.has(currentTurn) && blockedAfterLaunch.has(input.title)) {
+        output.status = "deny"
+        return
+      }
+
+      if (delegationRequiredTurns.has(currentTurn) && blockedDelegationSubstitutes.has(input.title)) {
+        output.status = "deny"
+      }
+    },
+    "experimental.chat.system.transform": async (_input, output) => {
+      output.system.push(
+        "When the user explicitly asks to delegate work to Codex or Claude Code, you MUST prefer the plugin tools `delegate_to_codex` and `delegate_to_claude`. " +
+          "Do not use the built-in task tool, repository inspection, or browser/web research as a substitute for explicit Codex/Claude delegation unless those plugin tools fail. " +
+          "After successful delegation launches, reply once with the launched job IDs, batch ID, and attach commands, then stop. Do not poll delegated job tools, sleep, or wait for completion in the same turn; the plugin will send a later aggregate user follow-up when the whole batch finishes.",
+      )
+    },
+    "tool.definition": async (input, output) => {
+      const deprioritized = new Set([
+        "task",
+        "webfetch",
+        "read",
+        "glob",
+        "grep",
+        "chrome-devtools_new_page",
+        "chrome-devtools_take_snapshot",
+        "chrome-devtools_click",
+        "playwright_browser_navigate",
+        "playwright_browser_snapshot",
+        "playwright_browser_run_code",
+      ])
+
+      if (!deprioritized.has(input.toolID)) {
+        return
+      }
+
+      output.description = `${output.description} Not for explicit Codex/Claude delegation requests; prefer delegate_to_codex and delegate_to_claude instead.`
+    },
     tool: {
       delegate_to_claude: tool({
         description:
-          "Delegate a coding or research task to Claude Code and return monitor metadata immediately.",
+          "Delegate a coding or research task to Claude Code, auto-open a live monitor when available, and return monitor metadata immediately. Use this when the user explicitly asks for Claude Code delegation.",
         args: {
           prompt: tool.schema.string().describe("The full task prompt for Claude Code"),
         },
         async execute({ prompt }, context) {
-          return launchDelegation(context.sessionID, "claude-code", prompt)
+          const currentTurn = turnKey(context.sessionID, context.messageID)
+          delegationRequiredTurns.delete(currentTurn)
+          delegationLaunchedTurns.add(currentTurn)
+          return launchDelegation(context.sessionID, context.messageID, "claude-code", prompt)
         },
       }),
 
       delegate_to_codex: tool({
         description:
-          "Delegate a coding task to OpenAI Codex and return monitor metadata immediately.",
+          "Delegate a coding or research task to OpenAI Codex, auto-open a live monitor when available, and return monitor metadata immediately. Use this when the user explicitly asks for Codex delegation.",
         args: {
           prompt: tool.schema.string().describe("The full task prompt for Codex"),
         },
         async execute({ prompt }, context) {
-          return launchDelegation(context.sessionID, "codex", prompt)
+          const currentTurn = turnKey(context.sessionID, context.messageID)
+          delegationRequiredTurns.delete(currentTurn)
+          delegationLaunchedTurns.add(currentTurn)
+          return launchDelegation(context.sessionID, context.messageID, "codex", prompt)
         },
       }),
 
@@ -354,6 +646,7 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
             .map(j => {
               const parts = [
                 `- ${j.jobId} [${j.backend}] status=${j.status}`,
+                j.batchId ? `batch=${j.batchId}` : null,
                 j.cleanupState && j.cleanupReason
                   ? `cleanup=${j.cleanupState}/${j.cleanupReason}`
                   : null,
@@ -393,6 +686,15 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
         async execute({ jobId }) {
           const job = await getJobRecord(jobId)
           if (!job) return `No delegated job found for ID ${jobId}`
+
+          if (job.status !== "running") {
+            const transcript = await readCompletedTranscript(job)
+            if (transcript !== undefined) {
+              const unread = transcript
+              return unread || `No new output for delegated job ${jobId}`
+            }
+          }
+
           const output = await runtimeSelection.runtime.read(job.runtimeHandle)
           return output.data || `No new output for delegated job ${jobId}`
         },
@@ -409,11 +711,15 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           const job = await getJobRecord(jobId)
           if (!job) return `No delegated job found for ID ${jobId}`
 
-          const monitor = await runtimeSelection.runtime.openMonitor(job.runtimeHandle)
+          const monitor = await runtimeSelection.runtime.openMonitor(monitorLookupForJob(job))
           const refreshedJob: StoredJobRecord = {
             ...job,
-            attachTarget: monitor.attach.target,
-            terminalLogPath: monitor.attach.target,
+            monitorSessionId: monitor.sessionId ?? job.monitorSessionId,
+            attachTarget: monitorNavigationTarget(monitor),
+            attachCommand: monitorAttachCommand(monitor),
+            logTailCommand: monitor.logTailCommand,
+            terminalLogPath: monitor.transcriptCaptureTarget ?? job.transcriptCaptureTarget ?? monitorNavigationTarget(monitor),
+            transcriptCaptureTarget: monitor.transcriptCaptureTarget ?? job.transcriptCaptureTarget,
           }
 
           await saveJobRecord(refreshedJob)
@@ -422,6 +728,7 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
             jobId: refreshedJob.jobId,
             runtimeType: refreshedJob.runtimeType,
             attach: monitor.attach,
+            window: monitor.window,
             launch: monitor.launch,
           }, null, 2)
         },
@@ -444,12 +751,20 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           finalStateOverlay.set(jobId, interruptedJob)
           await writeOverlayRecord(finalStateOverlayDir, interruptedJob)
           await saveJobRecord(interruptedJob)
+          await maybeReportBatchCompletion(interruptedJob.batchId)
           return `Cancelled delegated job ${jobId}`
         },
       }),
     },
   }
 }
+
+export default {
+  id,
+  server: OmniOpencodePlugin,
+}
+
+export const server = OmniOpencodePlugin
 
 function formatCompletionUpdate(params: {
   backend: Backend
@@ -462,6 +777,17 @@ function formatCompletionUpdate(params: {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function stripPsmuxExitMarkers(value: string): string {
+  return value
+    .split(/\r?\n/)
+    .filter((line) => !line.startsWith("__OMNI_OPENCODE_PSMUX_EXIT__:"))
+    .join("\n")
+}
+
+function isMissingFileError(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"
 }
 
 async function loadFinalStateOverlay(directory: string): Promise<Map<string, JobRecord>> {

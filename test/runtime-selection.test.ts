@@ -35,7 +35,7 @@ function createStubRuntime(mode: "pty" | "tmux"): Runtime {
 }
 
 describe("selectRuntime", () => {
-  it("selects the Windows PTY runtime on win32", () => {
+  it("selects the Windows psmux runtime on win32 while preserving the injected Windows runtime seam", () => {
     const createWindowsRuntime = vi.fn(() => createStubRuntime("pty"))
     const createTmuxRuntime = vi.fn(() => createStubRuntime("tmux"))
 
@@ -45,7 +45,7 @@ describe("selectRuntime", () => {
       createTmuxRuntime,
     })
 
-    expect(selected.kind).toBe("windows-pty")
+    expect(selected.kind).toBe("windows-psmux")
     expect(selected.autoOpenMonitor).toBe(true)
     expect(createWindowsRuntime).toHaveBeenCalledOnce()
     expect(createTmuxRuntime).not.toHaveBeenCalled()

@@ -5,7 +5,7 @@ describe("runtime abstraction", () => {
   it("starts a monitored job and exposes stable monitor metadata", async () => {
     const runtime = createFakeRuntime()
     const job = await runtime.start({ backend: "claude-code", command: "claude -p hello" })
-    const monitor = await runtime.openMonitor(job.id)
+    const monitor = await runtime.openMonitor({ type: "job", jobId: job.id })
 
     expect(job.monitor.id).toBeTruthy()
     expect(job.monitor.attach).toEqual({

@@ -64,4 +64,32 @@ describe("extractFinalReport", () => {
       source: "parsed",
     })
   })
+
+  it("falls back to the last meaningful line from terminal output when no explicit summary is present", () => {
+    const transcript = createTranscript()
+
+    appendTranscriptChunk(transcript, "OpenAI Codex v0.118.0\n")
+    appendTranscriptChunk(transcript, "tokens used\n")
+    appendTranscriptChunk(transcript, "8,016\n")
+    appendTranscriptChunk(transcript, "\u001b[0mThe title at the top of `README.md` is `Omni-Opencode`.\n")
+
+    expect(extractFinalReport(transcript)).toEqual({
+      summary: "The title at the top of `README.md` is `Omni-Opencode`.",
+      changedFiles: [],
+      source: "parsed",
+    })
+  })
+
+  it("strips OSC terminal control sequences when extracting the fallback summary", () => {
+    const transcript = createTranscript()
+
+    appendTranscriptChunk(transcript, "\u001b]0;claude\u0007The title at the top of README.md is \"Omni-Opencode\".\n")
+    appendTranscriptChunk(transcript, "\u001b[>4m\u001b[<u\u001b]9;4;0;\u0007\u001b]0;\u0007\u001b]0;Administrator: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\u0007\n")
+
+    expect(extractFinalReport(transcript)).toEqual({
+      summary: 'The title at the top of README.md is "Omni-Opencode".',
+      changedFiles: [],
+      source: "parsed",
+    })
+  })
 })

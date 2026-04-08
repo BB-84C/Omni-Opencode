@@ -110,9 +110,11 @@ function normalizeReport(value: unknown): ReportShape | null {
 
 function extractParsedReport(text: string): ReportShape {
   const lines = text.split(/\r?\n/)
-  const summary = lines
+  const explicitSummary = lines
     .map((line) => line.match(/^Summary:\s*(.+)$/i)?.[1]?.trim())
     .find((value): value is string => Boolean(value))
+
+  const summary = explicitSummary ?? extractFallbackSummary(lines)
 
   const changedFiles: string[] = []
   let inChangedFiles = false
@@ -137,4 +139,44 @@ function extractParsedReport(text: string): ReportShape {
   }
 
   return { summary, changedFiles }
+}
+
+function extractFallbackSummary(lines: string[]): string | undefined {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const candidate = stripAnsi(lines[index] ?? "").trim()
+
+    if (!candidate) {
+      continue
+    }
+
+    if (/^(tokens used|user|codex|exec)$/i.test(candidate)) {
+      continue
+    }
+
+    if (/^OpenAI Codex v/i.test(candidate) || /^[-]{2,}$/.test(candidate)) {
+      continue
+    }
+
+    if (/^(workdir|model|provider|approval|sandbox|reasoning effort|reasoning summaries|session id):/i.test(candidate)) {
+      continue
+    }
+
+    if (/^succeeded in \d+ms:?$/i.test(candidate)) {
+      continue
+    }
+
+    if (/^[\d,]+$/.test(candidate)) {
+      continue
+    }
+
+    return candidate
+  }
+
+  return undefined
+}
+
+function stripAnsi(value: string): string {
+  return value
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b\[[0-9:;<=>?]*[ -/]*[@-~]/g, "")
 }

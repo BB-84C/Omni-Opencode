@@ -2,17 +2,20 @@ import type {
   Runtime,
   RuntimeJob,
   RuntimeMonitor,
+  RuntimeMonitorLookup,
   RuntimeReadResult,
   RuntimeSnapshot,
   RuntimeStartParams,
 } from "./types.js"
 
 export type TmuxBackend = {
-  createSession(params: { sessionName: string; command: string; cwd?: string }): void | Promise<void>
+  createSession(params: { sessionName: string; command: string; cwd?: string }): { targetId: string } | Promise<{ targetId: string }>
+  joinSession(params: { sessionName: string; command: string; cwd?: string }): { targetId: string } | Promise<{ targetId: string }>
   readOutput(
-    sessionName: string,
+    targetId: string,
     cursor: string | undefined,
   ): { data: string; cursor?: string; active: boolean } | Promise<{ data: string; cursor?: string; active: boolean }>
+  killTarget(targetId: string): void | Promise<void>
   killSession(sessionName: string): void | Promise<void>
 }
 
@@ -25,8 +28,13 @@ export type TmuxRuntimeOptions = {
 
 type TmuxRuntimeState = {
   sessionName: string
+  targetId: string
   cursor?: string
   job: RuntimeJob
+}
+
+type SharedTmuxSession = {
+  jobIds: Set<string>
 }
 
 export function createTmuxRuntime(options: TmuxRuntimeOptions): Runtime {
@@ -37,6 +45,7 @@ export function createTmuxRuntime(options: TmuxRuntimeOptions): Runtime {
   }
 
   const jobs = new Map<string, TmuxRuntimeState>()
+  const sharedSessions = new Map<string, SharedTmuxSession>()
   const cwd = options.cwd
   const sessionPrefix = options.sessionPrefix ?? "omni"
   let nextId = 1
@@ -44,13 +53,17 @@ export function createTmuxRuntime(options: TmuxRuntimeOptions): Runtime {
   return {
     async start(params: RuntimeStartParams): Promise<RuntimeJob> {
       const id = `runtime-${nextId++}`
-      const sessionName = `${sessionPrefix}-${params.backend}-${nextId - 1}`
+      const sessionName = params.monitorSessionId
+        ? `${sessionPrefix}-${params.monitorSessionId}`
+        : `${sessionPrefix}-${params.backend}-${nextId - 1}`
       const monitor: RuntimeMonitor = {
         id: sessionName,
+        sessionId: params.monitorSessionId,
         attach: {
           mode: "tmux",
           target: sessionName,
         },
+        attachCommand: `tmux attach -t ${sessionName}`,
         launch: {
           command: params.command,
           cwd,
@@ -64,14 +77,28 @@ export function createTmuxRuntime(options: TmuxRuntimeOptions): Runtime {
         monitor,
       }
 
-      await options.backend.createSession({
-        sessionName,
-        command: params.command,
-        cwd,
-      })
+      const sharedSession = sharedSessions.get(sessionName)
+      const target = sharedSession
+        ? await options.backend.joinSession({
+            sessionName,
+            command: params.command,
+            cwd,
+          })
+        : await options.backend.createSession({
+            sessionName,
+            command: params.command,
+            cwd,
+          })
+
+      if (sharedSession) {
+        sharedSession.jobIds.add(id)
+      } else {
+        sharedSessions.set(sessionName, { jobIds: new Set([id]) })
+      }
 
       jobs.set(id, {
         sessionName,
+        targetId: target.targetId,
         job,
       })
 
@@ -80,11 +107,12 @@ export function createTmuxRuntime(options: TmuxRuntimeOptions): Runtime {
 
     async read(jobId: string): Promise<RuntimeReadResult> {
       const state = getState(jobs, jobId)
-      const result = await options.backend.readOutput(state.sessionName, state.cursor)
+      const result = await options.backend.readOutput(state.targetId, state.cursor)
       state.cursor = result.cursor
 
       if (!result.active) {
         state.job = { ...state.job, status: "stopped" }
+        releaseSessionJob(sharedSessions, state.sessionName, jobId)
       }
 
       return { data: result.data }
@@ -92,7 +120,12 @@ export function createTmuxRuntime(options: TmuxRuntimeOptions): Runtime {
 
     async stop(jobId: string): Promise<void> {
       const state = getState(jobs, jobId)
-      await options.backend.killSession(state.sessionName)
+      await options.backend.killTarget(state.targetId)
+
+      if (releaseSessionJob(sharedSessions, state.sessionName, jobId)) {
+        await options.backend.killSession(state.sessionName)
+      }
+
       state.job = { ...state.job, status: "stopped" }
     },
 
@@ -102,10 +135,35 @@ export function createTmuxRuntime(options: TmuxRuntimeOptions): Runtime {
       }
     },
 
-    async openMonitor(jobId: string): Promise<RuntimeMonitor> {
-      return getState(jobs, jobId).job.monitor
+    async openMonitor(lookup: RuntimeMonitorLookup): Promise<RuntimeMonitor> {
+      if (lookup.type !== "job") {
+        throw new Error(`Unknown runtime job: ${lookup.monitorSessionId}`)
+      }
+
+      return getState(jobs, lookup.jobId).job.monitor
     },
   }
+}
+
+function releaseSessionJob(
+  sharedSessions: Map<string, SharedTmuxSession>,
+  sessionName: string,
+  jobId: string,
+): boolean {
+  const sharedSession = sharedSessions.get(sessionName)
+
+  if (!sharedSession) {
+    return false
+  }
+
+  sharedSession.jobIds.delete(jobId)
+
+  if (sharedSession.jobIds.size > 0) {
+    return false
+  }
+
+  sharedSessions.delete(sessionName)
+  return true
 }
 
 function getState(jobs: Map<string, TmuxRuntimeState>, jobId: string): TmuxRuntimeState {

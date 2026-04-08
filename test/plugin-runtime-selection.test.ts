@@ -46,7 +46,7 @@ describe("plugin runtime selection seam", () => {
       command: "claude -p hello",
     })
 
-    expect(started.kind).toBe("windows-pty")
+    expect(started.kind).toBe("windows-psmux")
     expect(started.autoOpenMonitor).toBe(true)
     expect(started.job.id).toBe("job-1")
     expect(started.monitor).toEqual({

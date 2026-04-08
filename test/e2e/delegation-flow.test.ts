@@ -30,6 +30,7 @@ async function loadPluginWithCompletedRuntime() {
       monitor: {
         id: "claude-monitor-1",
         attach: { mode: "pty" as const, target: "claude-pty-1" },
+        attachCommand: "omni monitor claude-job-1",
         launch: { command, cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
       },
     })),
@@ -53,6 +54,7 @@ async function loadPluginWithCompletedRuntime() {
           monitor: {
             id: "claude-monitor-1",
             attach: { mode: "pty" as const, target: "claude-pty-1" },
+            attachCommand: "omni monitor claude-job-1",
             launch: { command: "attached claude-job-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
           },
         }],
@@ -61,6 +63,7 @@ async function loadPluginWithCompletedRuntime() {
     openMonitor: vi.fn(async (jobId: string) => ({
       id: `${jobId}-monitor`,
       attach: { mode: "pty" as const, target: `${jobId}-pty` },
+      attachCommand: `omni monitor ${jobId}`,
       launch: { command: `attached ${jobId}`, cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
     })),
   }
@@ -110,19 +113,26 @@ describe("delegation flow e2e", () => {
 
     expect(JSON.parse(launchResult)).toEqual(expect.objectContaining({
       jobId: "parent-session-1:claude-job-1",
+      batchId: "parent-session-1:message-1",
       parentSessionId: "parent-session-1",
       backend: "claude-code",
       status: "running",
+      attachCommand: "omni monitor claude-job-1",
     }))
     expect(runtime.openMonitor).toHaveBeenCalledWith("claude-job-1")
 
     await vi.waitFor(() => {
       expect(messageCreate).toHaveBeenCalledWith({
         sessionId: "parent-session-1",
-        role: "assistant",
+        role: "user",
         content: expect.stringContaining("completed through the PTY runtime monitor"),
       })
     })
+
+    const followUp = vi.mocked(messageCreate).mock.calls[0]?.[0]?.content
+    expect(followUp).toContain("delegated_job_snapshot")
+    expect(followUp).toContain("delegated_job_read")
+    expect(followUp).toContain("omni monitor claude-job-1")
 
     const snapshot = await plugin.tool!.delegated_job_snapshot.execute(
       { jobId: "parent-session-1:claude-job-1" },

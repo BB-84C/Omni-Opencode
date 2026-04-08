@@ -57,9 +57,11 @@ async function loadPlugin() {
         command,
         status: "running" as const,
         monitor: {
-          id: `${jobId}-monitor`,
-          attach: { mode: "pty" as const, target: `${jobId}-pty` },
-          launch: { command, cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
+          id: "monitor-parent-session-1",
+          sessionId: "parent-session-1",
+          attach: { mode: "pty" as const, target: "parent-session-1:dashboard" },
+          attachCommand: "psmux attach -t parent-session-1",
+          launch: { command: "psmux attach -t parent-session-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
         },
       }
     }),
@@ -80,28 +82,35 @@ async function loadPlugin() {
             : 'codex "watch the monitor"',
           status: calls >= 2 ? "stopped" as const : "running" as const,
           monitor: {
-            id: `${jobId}-monitor`,
-            attach: { mode: "pty" as const, target: `${jobId}-pty` },
-            launch: { command: `attached ${jobId}`, cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
+            id: "monitor-parent-session-1",
+            sessionId: "parent-session-1",
+            attach: { mode: "pty" as const, target: "parent-session-1:dashboard" },
+            attachCommand: "psmux attach -t parent-session-1",
+            launch: { command: "psmux attach -t parent-session-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
           },
         }
       }),
     })),
-    openMonitor: vi.fn(async (jobId: string) => ({
-      id: `${jobId}-monitor`,
-      attach: { mode: "pty" as const, target: `${jobId}-pty` },
-      launch: { command: `attached ${jobId}`, cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
+    openMonitor: vi.fn(async (lookup: { type: "job"; jobId: string } | { type: "shared-session"; monitorSessionId: string }) => ({
+      id: `monitor-${lookup.type === "shared-session" ? lookup.monitorSessionId : lookup.jobId}`,
+      sessionId: lookup.type === "shared-session" ? lookup.monitorSessionId : undefined,
+      attach: { mode: "pty" as const, target: `${lookup.type === "shared-session" ? lookup.monitorSessionId : lookup.jobId}:dashboard` },
+      attachCommand: `psmux attach -t ${lookup.type === "shared-session" ? lookup.monitorSessionId : lookup.jobId}`,
+      launch: {
+        command: `psmux attach -t ${lookup.type === "shared-session" ? lookup.monitorSessionId : lookup.jobId}`,
+        cwd: "D:/Omni-Opencode/.worktrees/pty-monitor",
+      },
     })),
   }
 
   vi.doMock("../../src/runtime/select-runtime.js", () => ({
     selectRuntime: () => ({
-      kind: "windows-pty" as const,
+      kind: "windows-psmux" as const,
       runtime,
       autoOpenMonitor: true,
-      start: async (params: { backend: "claude-code" | "codex"; command: string }) => {
+      start: async (params: { backend: "claude-code" | "codex"; command: string; monitorSessionId?: string }) => {
         const job = await runtime.start(params)
-        const monitor = await runtime.openMonitor(job.id)
+        const monitor = await runtime.openMonitor({ type: "shared-session", monitorSessionId: params.monitorSessionId ?? "missing-session" })
         return { job, monitor }
       },
     }),
@@ -144,7 +153,7 @@ function parseSnapshot(snapshot: string): {
 }
 
 describe("monitor flow e2e", () => {
-  it("launches both backends, advances transcript capture, reports completion, and records cleanup metadata", async () => {
+  it("launches both backends, blocks same-turn polling, then injects one aggregate follow-up after the batch completes", async () => {
     const { plugin, client } = await loadPlugin()
 
     const claudeLaunch = JSON.parse(await plugin.tool!.delegate_to_claude.execute(
@@ -152,6 +161,8 @@ describe("monitor flow e2e", () => {
       makeContext("parent-session-1") as never,
     )) as {
       jobId: string
+      batchId: string
+      attachCommand: string
       monitor: { attach: { target: string } }
     }
     const codexLaunch = JSON.parse(await plugin.tool!.delegate_to_codex.execute(
@@ -159,52 +170,67 @@ describe("monitor flow e2e", () => {
       makeContext("parent-session-1") as never,
     )) as {
       jobId: string
+      batchId: string
+      attachCommand: string
       monitor: { attach: { target: string } }
     }
 
-    expect(claudeLaunch.monitor.attach.target).toBe("claude-job-1-pty")
-    expect(codexLaunch.monitor.attach.target).toBe("codex-job-1-pty")
+    expect(claudeLaunch.batchId).toBe("parent-session-1:message-1")
+    expect(codexLaunch.batchId).toBe(claudeLaunch.batchId)
+    expect(claudeLaunch.attachCommand).toBe("psmux attach -t parent-session-1")
+    expect(codexLaunch.attachCommand).toBe("psmux attach -t parent-session-1")
+    expect(claudeLaunch.monitor.attach.target).toBe("parent-session-1:dashboard")
+    expect(codexLaunch.monitor.attach.target).toBe("parent-session-1:dashboard")
+
+    const deniedPollingDecision = { status: "allow" as const }
+    await plugin["permission.ask"]?.(
+      {
+        id: "perm-1",
+        type: "tool.execute",
+        sessionID: "parent-session-1",
+        messageID: "message-1",
+        title: "delegated_job_snapshot",
+        metadata: {},
+        time: { created: Date.now() },
+      } as never,
+      deniedPollingDecision,
+    )
+    expect(deniedPollingDecision.status).toBe("deny")
+
+    await vi.waitFor(() => {
+      expect(client.message.create).toHaveBeenCalledTimes(1)
+    })
+
+    const aggregateFollowUp = vi.mocked(client.message.create).mock.calls[0]?.[0]
+    expect(aggregateFollowUp).toMatchObject({
+      sessionId: "parent-session-1",
+      role: "user",
+    })
+    expect(aggregateFollowUp?.content).toContain("parent-session-1:message-1")
+    expect(aggregateFollowUp?.content).toContain(claudeLaunch.jobId)
+    expect(aggregateFollowUp?.content).toContain(codexLaunch.jobId)
+    expect(aggregateFollowUp?.content).toContain("delegated_job_snapshot")
+    expect(aggregateFollowUp?.content).toContain("delegated_job_read")
+    expect(aggregateFollowUp?.content).toContain("psmux attach -t parent-session-1")
 
     await vi.waitFor(async () => {
-      const claudeSnapshot = parseSnapshot(await plugin.tool!.delegated_job_snapshot.execute(
+      const claudeFinal = parseSnapshot(await plugin.tool!.delegated_job_snapshot.execute(
         { jobId: claudeLaunch.jobId },
         makeContext("parent-session-1") as never,
       ))
-      const codexSnapshot = parseSnapshot(await plugin.tool!.delegated_job_snapshot.execute(
+      const codexFinal = parseSnapshot(await plugin.tool!.delegated_job_snapshot.execute(
         { jobId: codexLaunch.jobId },
         makeContext("parent-session-1") as never,
       ))
 
-      expect(claudeSnapshot.transcriptByteLength).toBeGreaterThan(0)
-      expect(codexSnapshot.transcriptByteLength).toBeGreaterThan(0)
-      expect(claudeSnapshot.transcriptChunkCount).toBeGreaterThan(0)
-      expect(codexSnapshot.transcriptChunkCount).toBeGreaterThan(0)
+      for (const snapshot of [claudeFinal, codexFinal]) {
+        expect(snapshot.status).toBe("completed")
+        expect(snapshot.cleanupState).toBe("completed")
+        expect(snapshot.cleanupReason).toBe("completed")
+        expect(snapshot.summary).toBeTruthy()
+        expect(snapshot.transcriptByteLength).toBeGreaterThan(0)
+        expect(snapshot.transcriptChunkCount).toBeGreaterThan(0)
+      }
     })
-
-    await vi.waitFor(() => {
-      expect(client.message.create).toHaveBeenCalledTimes(2)
-    })
-
-    const parentUpdates = vi.mocked(client.message.create).mock.calls.map(([call]) => call.content)
-    expect(parentUpdates.some(content => content.includes(claudeLaunch.jobId) && content.includes("completed"))).toBe(true)
-    expect(parentUpdates.some(content => content.includes(codexLaunch.jobId) && content.includes("completed"))).toBe(true)
-
-    const claudeFinal = parseSnapshot(await plugin.tool!.delegated_job_snapshot.execute(
-      { jobId: claudeLaunch.jobId },
-      makeContext("parent-session-1") as never,
-    ))
-    const codexFinal = parseSnapshot(await plugin.tool!.delegated_job_snapshot.execute(
-      { jobId: codexLaunch.jobId },
-      makeContext("parent-session-1") as never,
-    ))
-
-    for (const snapshot of [claudeFinal, codexFinal]) {
-      expect(snapshot.status).toBe("completed")
-      expect(snapshot.cleanupState).toBe("completed")
-      expect(snapshot.cleanupReason).toBe("completed")
-      expect(snapshot.summary).toBeTruthy()
-      expect(snapshot.transcriptByteLength).toBeGreaterThan(0)
-      expect(snapshot.transcriptChunkCount).toBeGreaterThan(0)
-    }
   })
 })
