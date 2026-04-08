@@ -485,11 +485,10 @@ describe("PTY job controls", () => {
       return undefined
     })
     const runPsmuxQuery = vi.fn(async (command: string) => {
-      if (command === 'psmux list-panes -t parent-session-1:dashboard -F "#{pane_id} #{pane_left} #{pane_top} #{pane_width} #{pane_height}"') {
+      if (command === 'psmux list-panes -t parent-session-1:dashboard -F "#{pane_id} #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{pane_height}"') {
         return [
-          "%0 0 0 80 40",
-          "%1 81 0 39 19",
-          "%2 81 20 39 20",
+          "%0 0 0 0 120 60",
+          "%1 1 120 0 80 60",
         ].join("\n")
       }
 
