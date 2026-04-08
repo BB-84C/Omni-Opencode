@@ -1,4 +1,4 @@
-import { mkdir, readFile } from "node:fs/promises"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { spawn as spawnProcess } from "node:child_process"
 import type { EnsureManagedWindowsPsmuxInstalledOptions } from "./windows-psmux-managed.js"
 import type { WindowsPtyClient, WindowsPtyRuntimeOptions } from "./windows-pty.js"
@@ -11,6 +11,7 @@ import {
 } from "./windows-psmux-shared.js"
 import { join } from "node:path"
 import { ensureManagedWindowsPsmuxInstalled, resolveManagedWindowsPsmuxPaths } from "./windows-psmux-managed.js"
+import { buildDashboardSnapshot } from "./windows-dashboard-snapshot.js"
 
 export {
   WINDOWS_PSMUX_BOOTSTRAP_SCRIPT,
@@ -666,9 +667,24 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
     }
   }
 
-  async function renderSharedSessionDashboard(_session: SharedPsmuxSession): Promise<void> {
-    // Dashboard rendering is driven by the dedicated dashboard process
-    // which polls the snapshot file. Snapshot file writing is wired in Task 4.
+  async function renderSharedSessionDashboard(session: SharedPsmuxSession): Promise<void> {
+    const jobs = [...session.jobIds]
+      .map((jobId) => sharedJobs.get(jobId))
+      .filter((state): state is WindowsPsmuxState => state !== undefined)
+      .map((state) => ({
+        id: state.job.id,
+        backend: state.job.backend as "codex" | "claude-code",
+        windowIndex: state.executionWindowIndex ?? 0,
+        status: state.job.status === "stopped" ? "stopped" as const : "running" as const,
+      }))
+
+    const snapshot = buildDashboardSnapshot({
+      sessionId: session.sessionId,
+      jobs,
+    })
+
+    await mkdir(join(logDirectory), { recursive: true })
+    await writeFile(session.snapshotPath, JSON.stringify(snapshot, null, 2), "utf8")
   }
 
   async function readSharedJobTranscriptDelta(

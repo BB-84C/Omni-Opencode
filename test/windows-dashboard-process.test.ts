@@ -1,10 +1,18 @@
-import { describe, expect, it } from "vitest"
+import { readFile } from "node:fs/promises"
+import { mkdtemp } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { describe, expect, it, vi } from "vitest"
 import {
   buildDashboardSnapshot,
   type DashboardSnapshot,
   type DashboardSnapshotJob,
 } from "../src/runtime/windows-dashboard-snapshot.js"
 import { renderDashboard } from "../src/runtime/windows-dashboard-renderer.js"
+import {
+  createWindowsPsmuxRuntime,
+  buildWindowsPsmuxDashboardSnapshotPath,
+} from "../src/runtime/windows-psmux.js"
 
 describe("Dashboard snapshot contract", () => {
   it("includes the parent session id", () => {
@@ -315,5 +323,173 @@ describe("Dashboard ANSI renderer", () => {
     )
 
     expect(output).toContain("fix auth bug")
+  })
+})
+
+function createManagedInstallResult() {
+  return {
+    binaryPath: "psmux",
+    manifestPath: "D:/Omni-Opencode/.omni-tools/psmux/manifest.json",
+    installed: false,
+  }
+}
+
+function createTwoPaneDashboardGeometry() {
+  return [
+    "%11 0 0 0 120 60",
+    "%12 1 120 0 80 60",
+  ].join("\n")
+}
+
+function createSnapshotTestQuery(sessionId: string, jobWindowOutputs: Record<string, string>) {
+  return vi.fn(async (command: string) => {
+    if (command.includes(`list-panes -t ${sessionId}:dashboard`)) {
+      return createTwoPaneDashboardGeometry()
+    }
+
+    for (const [name, output] of Object.entries(jobWindowOutputs)) {
+      if (command.includes('new-window -P -F "#{window_index} #{pane_id}"') && command.includes(name)) {
+        return output
+      }
+    }
+
+    throw new Error(`Unexpected query: ${command}`)
+  })
+}
+
+async function readSnapshotFile(path: string): Promise<DashboardSnapshot> {
+  const raw = await readFile(path, "utf8")
+  return JSON.parse(raw) as DashboardSnapshot
+}
+
+describe("Dashboard snapshot file writes", () => {
+  it("writes a snapshot file when the shared session is created", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "dashboard-snap-"))
+    const runPsmuxCommand = vi.fn(async () => undefined)
+    const runPsmuxQuery = createSnapshotTestQuery("parent-session-1", {
+      "job-runtime-1": "1 %31",
+    })
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runPsmuxCommand,
+      runPsmuxQuery,
+      buildDashboardProcessCommand: (snapshotPath) => `node --dashboard "${snapshotPath}"`,
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec "hello"',
+      monitorSessionId: "parent-session-1",
+    })
+
+    const snapshotPath = buildWindowsPsmuxDashboardSnapshotPath(join(cwd, ".omni-monitors"), "parent-session-1")
+    const snapshot = await readSnapshotFile(snapshotPath)
+
+    expect(snapshot.sessionId).toBe("parent-session-1")
+    expect(snapshot.title).toBe("OMNI-OPENCODE DASHBOARD")
+    expect(snapshot.jobs).toHaveLength(1)
+    expect(snapshot.jobs[0]?.id).toBe("runtime-1")
+    expect(snapshot.jobs[0]?.backend).toBe("codex")
+    expect(snapshot.jobs[0]?.status).toBe("running")
+    expect(snapshot.jobs[0]?.windowIndex).toBe(1)
+  })
+
+  it("updates the snapshot file when a new job starts", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "dashboard-snap-"))
+    const runPsmuxCommand = vi.fn(async () => undefined)
+    const hasSharedSession = vi.fn(async () => false)
+    hasSharedSession.mockResolvedValueOnce(false)
+    hasSharedSession.mockResolvedValueOnce(true)
+    const runPsmuxQuery = createSnapshotTestQuery("parent-session-1", {
+      "job-runtime-1": "1 %31",
+      "job-runtime-2": "2 %41",
+    })
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession,
+      runPsmuxCommand,
+      runPsmuxQuery,
+      buildDashboardProcessCommand: (snapshotPath) => `node --dashboard "${snapshotPath}"`,
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec "alpha"',
+      monitorSessionId: "parent-session-1",
+    })
+    await runtime.start({
+      backend: "claude-code",
+      command: 'claude --print "beta"',
+      monitorSessionId: "parent-session-1",
+    })
+
+    const snapshotPath = buildWindowsPsmuxDashboardSnapshotPath(join(cwd, ".omni-monitors"), "parent-session-1")
+    const snapshot = await readSnapshotFile(snapshotPath)
+
+    expect(snapshot.jobs).toHaveLength(2)
+    expect(snapshot.jobs[0]?.id).toBe("runtime-1")
+    expect(snapshot.jobs[1]?.id).toBe("runtime-2")
+    expect(snapshot.jobs[1]?.backend).toBe("claude-code")
+    expect(snapshot.jobs[1]?.status).toBe("running")
+  })
+
+  it("updates the snapshot file when a job stops", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "dashboard-snap-"))
+    const runPsmuxCommand = vi.fn(async () => undefined)
+    const hasSharedSession = vi.fn(async () => false)
+    hasSharedSession.mockResolvedValueOnce(false)
+    hasSharedSession.mockResolvedValueOnce(true)
+    const runPsmuxQuery = createSnapshotTestQuery("parent-session-1", {
+      "job-runtime-1": "1 %31",
+      "job-runtime-2": "2 %41",
+    })
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession,
+      runPsmuxCommand,
+      runPsmuxQuery,
+      buildDashboardProcessCommand: (snapshotPath) => `node --dashboard "${snapshotPath}"`,
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec "alpha"',
+      monitorSessionId: "parent-session-1",
+    })
+    await runtime.start({
+      backend: "claude-code",
+      command: 'claude --print "beta"',
+      monitorSessionId: "parent-session-1",
+    })
+    await runtime.stop("runtime-2")
+
+    const snapshotPath = buildWindowsPsmuxDashboardSnapshotPath(join(cwd, ".omni-monitors"), "parent-session-1")
+    const snapshot = await readSnapshotFile(snapshotPath)
+
+    expect(snapshot.jobs).toHaveLength(1)
+    expect(snapshot.jobs[0]?.id).toBe("runtime-1")
+    expect(snapshot.jobs[0]?.status).toBe("running")
+  })
+
+  it("isolates snapshot files per parent session", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "dashboard-snap-"))
+    const logDir = join(cwd, ".omni-monitors")
+
+    const pathA = buildWindowsPsmuxDashboardSnapshotPath(logDir, "parent-session-A")
+    const pathB = buildWindowsPsmuxDashboardSnapshotPath(logDir, "parent-session-B")
+
+    expect(pathA).not.toBe(pathB)
+    expect(pathA).toContain("parent-session-A")
+    expect(pathB).toContain("parent-session-B")
   })
 })
