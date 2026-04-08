@@ -549,6 +549,7 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
       : await hasWindowsPsmuxSession(params.monitorSessionId, psmuxCommand, runPsmuxCommand)
 
     const snapshotPath = buildWindowsPsmuxDashboardSnapshotPath(logDirectory, params.monitorSessionId)
+    await ensureDashboardProcessScript(logDirectory)
     const dashboardCommand = buildDashboardCommand(snapshotPath)
 
     if (!sharedSessionExists) {
@@ -869,6 +870,64 @@ function buildWindowsPsmuxRespawnDashboardCommand(psmuxCommand: string, paneTarg
   return `${psmuxCommand} respawn-pane -k -t ${paneTarget} -- ${dashboardCommand}`
 }
 
+const DASHBOARD_PROCESS_SCRIPT = `const fs = require('fs');
+const P = 500;
+const S = ['\\u280b','\\u2819','\\u2839','\\u2838','\\u283c','\\u2834','\\u2826','\\u2827','\\u2807','\\u280f'];
+const A = {r:'\\x1b[0m',b:'\\x1b[1m',d:'\\x1b[2m',c:'\\x1b[36m',g:'\\x1b[32m',e:'\\x1b[31m',y:'\\x1b[33m',l:'\\x1b[34m',w:'\\x1b[37m',x:'\\x1b[90m'};
+let lv = -1, f = 0, ls = null;
+function sm(s, f) {
+  if (s === 'running') return A.c + S[f % S.length] + A.r;
+  if (s === 'completed') return A.g + '\\u2713' + A.r;
+  if (s === 'failed') return A.e + '\\u2717' + A.r;
+  return A.y + '\\u25a0' + A.r;
+}
+function sc(s) {
+  if (s === 'running') return A.w;
+  if (s === 'completed') return A.g;
+  if (s === 'failed') return A.e;
+  return A.y;
+}
+function sep() { return A.x + '\\u2500'.repeat(40) + A.r; }
+function render(sn, f) {
+  const l = ['', '  ' + A.b + A.c + sn.title + A.r, '  ' + A.x + 'Session: ' + A.w + sn.sessionId + A.r, '', sep()];
+  if (!sn.jobs || sn.jobs.length === 0) {
+    l.push('', '  ' + A.d + 'No delegated jobs yet. Waiting for work...' + A.r, '');
+  } else {
+    l.push('', '  ' + A.b + 'Delegated Jobs' + A.r, '');
+    for (const j of sn.jobs) {
+      const lb = j.label ? ' ' + A.x + '(' + j.label + ')' + A.r : '';
+      l.push('  ' + sm(j.status, f) + ' ' + sc(j.status) + j.id + A.r + ' ' + A.d + '[' + j.backend + ']' + A.r + ' -> ' + A.l + 'window ' + j.windowIndex + A.r + lb);
+    }
+    l.push('');
+  }
+  l.push(sep(), '');
+  if (sn.navigation) for (const h of sn.navigation) l.push('  ' + A.x + h + A.r);
+  l.push('');
+  process.stdout.write('\\x1b[2J\\x1b[H' + l.join('\\n'));
+}
+function tick() {
+  f++;
+  try {
+    const raw = fs.readFileSync(process.argv[2], 'utf8');
+    const sn = JSON.parse(raw);
+    ls = sn;
+    const hr = sn.jobs && sn.jobs.some(function(j) { return j.status === 'running'; });
+    if (sn.version !== lv || hr) { render(sn, f); lv = sn.version; }
+  } catch (e) {
+    if (ls) { render(ls, f); }
+    else { process.stdout.write('\\x1b[2J\\x1b[H\\n  ' + A.d + 'Waiting for dashboard data...' + A.r + '\\n'); }
+  }
+}
+tick();
+setInterval(tick, P);
+`
+
+async function ensureDashboardProcessScript(logDir: string): Promise<void> {
+  await mkdir(logDir, { recursive: true })
+  const scriptPath = buildWindowsPsmuxDashboardScriptPath(logDir)
+  await writeFile(scriptPath, DASHBOARD_PROCESS_SCRIPT, "utf8")
+}
+
 function buildWindowsPsmuxDashboardShellSplitCommand(psmuxCommand: string, target: string, shell: string): string {
   return `${psmuxCommand} split-window -t ${target} -h -p 35 -d -- ${shell} -NoLogo -NoProfile`
 }
@@ -1109,8 +1168,14 @@ export function buildWindowsPsmuxDashboardSnapshotPath(logDirectory: string, ses
   return normalizeWindowsPsmuxPath(join(logDirectory, `${sessionId}-dashboard.json`))
 }
 
+export function buildWindowsPsmuxDashboardScriptPath(logDirectory: string): string {
+  return normalizeWindowsPsmuxPath(join(logDirectory, "dashboard-process.cjs"))
+}
+
 function buildDefaultDashboardProcessCommand(snapshotPath: string): string {
-  return `node -e "const fs=require('fs');const P=500;const S=['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];const A={r:'\\x1b[0m',b:'\\x1b[1m',d:'\\x1b[2m',c:'\\x1b[36m',g:'\\x1b[32m',e:'\\x1b[31m',y:'\\x1b[33m',l:'\\x1b[34m',w:'\\x1b[37m',x:'\\x1b[90m'};let lv=-1,f=0,ls=null;function sm(s,f){if(s==='running')return A.c+S[f%S.length]+A.r;if(s==='completed')return A.g+'✓'+A.r;if(s==='failed')return A.e+'✗'+A.r;return A.y+'■'+A.r}function sc(s){if(s==='running')return A.w;if(s==='completed')return A.g;if(s==='failed')return A.e;return A.y}function sep(){return A.x+'─'.repeat(40)+A.r}function render(sn,f){const l=['','  '+A.b+A.c+sn.title+A.r,'  '+A.x+'Session: '+A.w+sn.sessionId+A.r,'',sep()];if(!sn.jobs||sn.jobs.length===0){l.push('','  '+A.d+'No delegated jobs yet. Waiting for work...'+A.r,'')}else{l.push('','  '+A.b+'Delegated Jobs'+A.r,'');for(const j of sn.jobs){const lb=j.label?' '+A.x+'('+j.label+')'+A.r:'';l.push('  '+sm(j.status,f)+' '+sc(j.status)+j.id+A.r+' '+A.d+'['+j.backend+']'+A.r+' -> '+A.l+'window '+j.windowIndex+A.r+lb)}l.push('')}l.push(sep(),'');if(sn.navigation)for(const h of sn.navigation)l.push('  '+A.x+h+A.r);l.push('');process.stdout.write('\\x1b[2J\\x1b[H'+l.join('\\n'))}function tick(){f++;try{const raw=fs.readFileSync('${snapshotPath.replace(/'/g, "\\'")}','utf8');const sn=JSON.parse(raw);ls=sn;const hr=sn.jobs&&sn.jobs.some(j=>j.status==='running');if(sn.version!==lv||hr){render(sn,f);lv=sn.version}}catch(e){if(ls){render(ls,f)}else{process.stdout.write('\\x1b[2J\\x1b[H\\n  '+A.d+'Waiting for dashboard data...'+A.r+'\\n')}}}tick();setInterval(tick,P)"`
+  const scriptDir = snapshotPath.replace(/\/[^/]+$/, "")
+  const scriptPath = normalizeWindowsPsmuxPath(join(scriptDir, "dashboard-process.cjs"))
+  return `node "${scriptPath}" "${snapshotPath}"`
 }
 
 async function loadWindowsPtyRuntime(options: WindowsPtyRuntimeOptions): Promise<Runtime> {
