@@ -4,6 +4,7 @@ import {
   type DashboardSnapshot,
   type DashboardSnapshotJob,
 } from "../src/runtime/windows-dashboard-snapshot.js"
+import { renderDashboard } from "../src/runtime/windows-dashboard-renderer.js"
 
 describe("Dashboard snapshot contract", () => {
   it("includes the parent session id", () => {
@@ -158,7 +159,7 @@ describe("Dashboard snapshot contract", () => {
     expect(snapshotB.jobs[0]?.id).toBe("runtime-5")
   })
 
-  it("serializes to JSON for file-based consumption", () => {
+  it("serializes to JSON for file-based consumption and round-trips cleanly", () => {
     const snapshot = buildDashboardSnapshot({
       sessionId: "parent-session-1",
       jobs: [
@@ -172,5 +173,147 @@ describe("Dashboard snapshot contract", () => {
     expect(parsed.sessionId).toBe("parent-session-1")
     expect(parsed.jobs).toHaveLength(1)
     expect(parsed.title).toBe("OMNI-OPENCODE DASHBOARD")
+  })
+})
+
+describe("Dashboard ANSI renderer", () => {
+  function makeSnapshot(
+    overrides: Partial<DashboardSnapshot> & { jobs?: DashboardSnapshotJob[] } = {},
+  ): DashboardSnapshot {
+    return {
+      sessionId: "parent-session-1",
+      title: "OMNI-OPENCODE DASHBOARD",
+      jobs: [],
+      navigation: [
+        "Use Ctrl+b then n/p to cycle windows.",
+        "Use Ctrl+b then 0 to return here.",
+      ],
+      version: 1,
+      ...overrides,
+    }
+  }
+
+  it("includes the dashboard title and session id in output", () => {
+    const output = renderDashboard(makeSnapshot(), 0)
+
+    expect(output).toContain("OMNI-OPENCODE DASHBOARD")
+    expect(output).toContain("parent-session-1")
+  })
+
+  it("renders running jobs with an animated spinner frame token", () => {
+    const output0 = renderDashboard(
+      makeSnapshot({
+        jobs: [{ id: "runtime-1", backend: "codex", windowIndex: 1, status: "running" }],
+      }),
+      0,
+    )
+    const output1 = renderDashboard(
+      makeSnapshot({
+        jobs: [{ id: "runtime-1", backend: "codex", windowIndex: 1, status: "running" }],
+      }),
+      1,
+    )
+
+    // Both frames should contain the job but have different spinner characters
+    expect(output0).toContain("runtime-1")
+    expect(output1).toContain("runtime-1")
+    // At least one frame differs (spinner animation)
+    expect(output0 !== output1).toBe(true)
+  })
+
+  it("renders completed jobs with a green check marker", () => {
+    const output = renderDashboard(
+      makeSnapshot({
+        jobs: [{ id: "runtime-1", backend: "codex", windowIndex: 1, status: "completed" }],
+      }),
+      0,
+    )
+
+    // Should contain ANSI green color code
+    expect(output).toMatch(/\x1b\[32m/)
+    expect(output).toContain("runtime-1")
+  })
+
+  it("renders failed jobs with a red marker", () => {
+    const output = renderDashboard(
+      makeSnapshot({
+        jobs: [{ id: "runtime-1", backend: "codex", windowIndex: 1, status: "failed" }],
+      }),
+      0,
+    )
+
+    // Should contain ANSI red color code
+    expect(output).toMatch(/\x1b\[31m/)
+    expect(output).toContain("runtime-1")
+  })
+
+  it("renders stopped and cancelled jobs with a dim/yellow marker", () => {
+    for (const status of ["stopped", "cancelled"] as const) {
+      const output = renderDashboard(
+        makeSnapshot({
+          jobs: [{ id: "runtime-1", backend: "codex", windowIndex: 1, status }],
+        }),
+        0,
+      )
+
+      // Should contain ANSI yellow (33) or dim (2) code
+      expect(output).toMatch(/\x1b\[(?:33|2)m/)
+      expect(output).toContain("runtime-1")
+    }
+  })
+
+  it("uses ANSI colors and section structure", () => {
+    const output = renderDashboard(
+      makeSnapshot({
+        jobs: [
+          { id: "runtime-1", backend: "codex", windowIndex: 1, status: "running" },
+          { id: "runtime-2", backend: "claude-code", windowIndex: 2, status: "completed" },
+        ],
+      }),
+      0,
+    )
+
+    // Contains ANSI escape codes
+    expect(output).toMatch(/\x1b\[/)
+    // Contains section separators or structural elements
+    expect(output).toContain("codex")
+    expect(output).toContain("claude-code")
+    expect(output).toContain("window 1")
+    expect(output).toContain("window 2")
+  })
+
+  it("never includes a PowerShell prompt", () => {
+    const output = renderDashboard(makeSnapshot(), 0)
+
+    expect(output).not.toContain("PS ")
+    expect(output).not.toContain("PS>")
+    expect(output).not.toMatch(/PS [A-Z]:\\/)
+  })
+
+  it("renders a waiting state when there are no jobs", () => {
+    const output = renderDashboard(makeSnapshot({ jobs: [] }), 0)
+
+    expect(output).toContain("OMNI-OPENCODE DASHBOARD")
+    // Should indicate no jobs or waiting
+    expect(output.toLowerCase()).toMatch(/no.*job|waiting|none/)
+  })
+
+  it("includes navigation hints in the output", () => {
+    const output = renderDashboard(makeSnapshot(), 0)
+
+    expect(output).toContain("Ctrl+b")
+  })
+
+  it("shows the job label when present", () => {
+    const output = renderDashboard(
+      makeSnapshot({
+        jobs: [
+          { id: "runtime-1", backend: "codex", windowIndex: 1, status: "running", label: "fix auth bug" },
+        ],
+      }),
+      0,
+    )
+
+    expect(output).toContain("fix auth bug")
   })
 })
