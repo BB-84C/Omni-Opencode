@@ -52,6 +52,7 @@ export type WindowsPsmuxRuntimeOptions = {
   runPsmuxCommand?: (command: string) => Promise<void> | void
   runPsmuxQuery?: (command: string) => Promise<string> | string
   runShellCommand?: (command: string) => Promise<void> | void
+  runPsmuxSendKeys?: (psmuxCommand: string, paneTarget: string, text: string) => Promise<void> | void
   hasSharedSession?: (sessionId: string) => Promise<boolean> | boolean
   open?: (params: {
     jobId: string
@@ -286,6 +287,10 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
   const logDirectory = join(cwd ?? process.cwd(), ".omni-monitors")
   const managedPsmuxPaths = resolveManagedWindowsPsmuxPaths({ cwd, platform, arch })
   const readTranscriptCaptureFile = options.readTranscriptCaptureFile ?? readWindowsPsmuxTranscriptChunk
+  const runPsmuxSendKeys = options.runPsmuxSendKeys
+    ?? (options.runPsmuxCommand || options.runShellCommand
+      ? (psmuxCmd: string, paneTarget: string, text: string) => runPsmuxCommand(buildWindowsPsmuxSendKeysCommand(psmuxCmd, paneTarget, text))
+      : runWindowsPsmuxSendKeysDirect)
   const buildDashboardCommand = options.buildDashboardProcessCommand ?? buildDefaultDashboardProcessCommand
   const sharedJobs = new Map<string, WindowsPsmuxState>()
   const sharedSessions = new Map<string, SharedPsmuxSession>()
@@ -479,6 +484,7 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
       psmuxCommand,
       runPsmuxQuery,
       runPsmuxCommand,
+      runPsmuxSendKeys,
     )
     await configureWindowsPsmuxPipePaneBookkeeping(logDirectory, executionWindow.paneTarget, transcriptLogPath, psmuxCommand, runPsmuxCommand)
     const monitor: RuntimeMonitor = {
@@ -827,6 +833,7 @@ async function createWindowsPsmuxJobExecutionTarget(
   psmuxCommand: string,
   runPsmuxQuery: (command: string) => Promise<string> | string,
   runPsmuxCommand: (command: string) => Promise<void> | void,
+  sendKeys: (psmuxCommand: string, paneTarget: string, text: string) => Promise<void> | void,
 ): Promise<WindowsPsmuxExecutionWindow> {
   const executionWindows = parseWindowsPsmuxExecutionWindows(
     await runPsmuxQuery(buildWindowsPsmuxNewWindowShellCommand(psmuxCommand, sessionId, jobId, shell)),
@@ -839,7 +846,7 @@ async function createWindowsPsmuxJobExecutionTarget(
   const executionWindow = executionWindows[0]!
   const windowTarget = `${sessionId}:${executionWindow.index}`
   await runPsmuxCommand(`${psmuxCommand} set-option -t ${windowTarget} remain-on-exit on`)
-  await runPsmuxCommand(buildWindowsPsmuxSendKeysCommand(psmuxCommand, executionWindow.paneTarget, buildWindowsPsmuxWrappedCommand(command)))
+  await sendKeys(psmuxCommand, executionWindow.paneTarget, buildWindowsPsmuxJobPaneCommand(command))
   return {
     ...executionWindow,
     target: windowTarget,
@@ -867,6 +874,27 @@ function buildWindowsPsmuxPipePaneCommand(psmuxCommand: string, target: string, 
 
 function buildWindowsPsmuxSendKeysCommand(psmuxCommand: string, target: string, text: string): string {
   return `${psmuxCommand} send-keys -t ${target} '${escapeWindowsPsmuxPowerShellString(text)}' Enter`
+}
+
+function buildWindowsPsmuxJobPaneCommand(command: string): string {
+  return `${command}; Write-Output "${WINDOWS_PSMUX_EXIT_MARKER}$(if ($global:LASTEXITCODE -ne $null) { $global:LASTEXITCODE } elseif ($?) { 0 } else { 1 })"`
+}
+
+function runWindowsPsmuxSendKeysDirect(psmuxCommand: string, paneTarget: string, text: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawnProcess(psmuxCommand, ["send-keys", "-t", paneTarget, text, "Enter"], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    child.on("error", reject)
+    child.on("close", (exitCode) => {
+      if (exitCode === 0) {
+        resolve()
+        return
+      }
+      reject(new Error(`psmux send-keys failed with exit code ${exitCode}`))
+    })
+  })
 }
 
 function buildWindowsPsmuxNewSessionCommand(psmuxCommand: string, sessionId: string, dashboardCommand: string): string {
