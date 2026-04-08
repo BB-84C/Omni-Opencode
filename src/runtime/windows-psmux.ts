@@ -582,6 +582,11 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
           psmuxCommand,
           runPsmuxQuery,
         )
+        await runPsmuxCommand(buildWindowsPsmuxRespawnDashboardCommand(
+          psmuxCommand,
+          sharedSession.dashboard.panes.dashboard.target,
+          dashboardCommand,
+        ))
       } catch (error) {
         if (!isWindowsPsmuxDashboardContractMismatch(error, params.monitorSessionId)) {
           throw error
@@ -858,6 +863,10 @@ function buildWindowsPsmuxSendKeysCommand(psmuxCommand: string, target: string, 
 
 function buildWindowsPsmuxNewSessionCommand(psmuxCommand: string, sessionId: string, dashboardCommand: string): string {
   return `${psmuxCommand} new-session -d -s ${sessionId} -n dashboard -- ${dashboardCommand}`
+}
+
+function buildWindowsPsmuxRespawnDashboardCommand(psmuxCommand: string, paneTarget: string, dashboardCommand: string): string {
+  return `${psmuxCommand} respawn-pane -k -t ${paneTarget} -- ${dashboardCommand}`
 }
 
 function buildWindowsPsmuxDashboardShellSplitCommand(psmuxCommand: string, target: string, shell: string): string {

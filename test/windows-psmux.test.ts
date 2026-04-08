@@ -1202,6 +1202,89 @@ describe("Windows psmux runtime contract", () => {
     expect(runPsmuxCommand.mock.calls.map(([c]) => c).filter((c: string) => c.includes("new-session -d -s parent-session-invalid-discovery"))).toEqual([])
   })
 
+  it("respawns the dashboard process in the left pane when reattaching to an existing session", async () => {
+    const runPsmuxCommand = vi.fn(async () => undefined)
+    const hasSharedSession = vi.fn(async () => true)
+    const runPsmuxQuery = createDashboardQueryStub()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: "D:/Omni-Opencode",
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession,
+      runPsmuxCommand,
+      runPsmuxQuery,
+      buildDashboardProcessCommand: stubDashboardProcessCommand,
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec "alpha"',
+      monitorSessionId: "parent-session-respawn",
+    })
+
+    const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
+    const respawnCommands = commands.filter((command) => command.includes("respawn-pane"))
+
+    expect(respawnCommands).toHaveLength(1)
+    expect(respawnCommands[0]).toContain("respawn-pane -k -t %11")
+    expect(respawnCommands[0]).toContain("node --dashboard-process")
+    expect(commands.filter((command) => command.includes("kill-session"))).toEqual([])
+    expect(commands.filter((command) => command.includes("kill-window -t parent-session-respawn:dashboard"))).toEqual([])
+  })
+
+  it("does not respawn the dashboard process when creating a brand new session", async () => {
+    const runPsmuxCommand = vi.fn(async () => undefined)
+    const hasSharedSession = vi.fn(async () => false)
+    const runPsmuxQuery = createDashboardQueryStub()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: "D:/Omni-Opencode",
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession,
+      runPsmuxCommand,
+      runPsmuxQuery,
+      buildDashboardProcessCommand: stubDashboardProcessCommand,
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec "alpha"',
+      monitorSessionId: "parent-session-new",
+    })
+
+    const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
+    expect(commands.filter((command) => command.includes("respawn-pane"))).toEqual([])
+  })
+
+  it("preserves the right-pane shell and job windows when respawning the dashboard process", async () => {
+    const runPsmuxCommand = vi.fn(async () => undefined)
+    const hasSharedSession = vi.fn(async () => true)
+    const runPsmuxQuery = createDashboardQueryStub()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: "D:/Omni-Opencode",
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession,
+      runPsmuxCommand,
+      runPsmuxQuery,
+      buildDashboardProcessCommand: stubDashboardProcessCommand,
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec "alpha"',
+      monitorSessionId: "parent-session-preserve",
+    })
+
+    const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
+
+    expect(commands.filter((command) => command.includes("kill-session"))).toEqual([])
+    expect(commands.filter((command) => command.includes("kill-window"))).toEqual([])
+    expect(commands.filter((command) => command.includes("split-window"))).toEqual([])
+    expect(commands.filter((command) => command.includes("respawn-pane -k -t %11"))).toHaveLength(1)
+    expect(commands.filter((command) => command.includes("respawn-pane -k -t %12"))).toEqual([])
+  })
+
   it("does not discard a live cached shared session just because one has-session probe says false", async () => {
     const runPsmuxCommand = vi.fn(async () => undefined)
     const hasSharedSession = vi.fn(async () => false)
