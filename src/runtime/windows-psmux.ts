@@ -79,6 +79,7 @@ export type WindowsPsmuxRuntimeOptions = {
     target: string,
     offset: number,
   ) => Promise<WindowsPsmuxTranscriptChunk> | WindowsPsmuxTranscriptChunk
+  buildDashboardProcessCommand?: (snapshotPath: string) => string
 }
 
 type WindowsPsmuxState = {
@@ -142,6 +143,7 @@ type SharedPsmuxSession = {
   dashboard: WindowsPsmuxDashboardLayout
   jobIds: Set<string>
   opened: boolean
+  snapshotPath: string
 }
 
 export function createWindowsPsmuxDashboardLayout(sessionId: string): WindowsPsmuxDashboardLayout {
@@ -283,6 +285,7 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
   const logDirectory = join(cwd ?? process.cwd(), ".omni-monitors")
   const managedPsmuxPaths = resolveManagedWindowsPsmuxPaths({ cwd, platform, arch })
   const readTranscriptCaptureFile = options.readTranscriptCaptureFile ?? readWindowsPsmuxTranscriptChunk
+  const buildDashboardCommand = options.buildDashboardProcessCommand ?? buildDefaultDashboardProcessCommand
   const sharedJobs = new Map<string, WindowsPsmuxState>()
   const sharedSessions = new Map<string, SharedPsmuxSession>()
   let runtimePromise: Promise<Runtime> | undefined
@@ -544,9 +547,12 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
       ? await options.hasSharedSession(params.monitorSessionId)
       : await hasWindowsPsmuxSession(params.monitorSessionId, psmuxCommand, runPsmuxCommand)
 
+    const snapshotPath = buildWindowsPsmuxDashboardSnapshotPath(logDirectory, params.monitorSessionId)
+    const dashboardCommand = buildDashboardCommand(snapshotPath)
+
     if (!sharedSessionExists) {
       await runPsmuxCommand(`${psmuxCommand} start-server`)
-      await runPsmuxCommand(buildWindowsPsmuxNewSessionCommand(psmuxCommand, params.monitorSessionId, shell))
+      await runPsmuxCommand(buildWindowsPsmuxNewSessionCommand(psmuxCommand, params.monitorSessionId, dashboardCommand))
     }
 
     const sharedSession: SharedPsmuxSession = {
@@ -557,6 +563,7 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
       dashboard: createWindowsPsmuxDashboardLayout(params.monitorSessionId),
       jobIds: new Set<string>(),
       opened: false,
+      snapshotPath,
     }
 
     if (!sharedSessionExists) {
@@ -581,7 +588,7 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
 
         await runPsmuxCommand(`${psmuxCommand} kill-session -t ${params.monitorSessionId}`)
         await runPsmuxCommand(`${psmuxCommand} start-server`)
-        await runPsmuxCommand(buildWindowsPsmuxNewSessionCommand(psmuxCommand, params.monitorSessionId, shell))
+        await runPsmuxCommand(buildWindowsPsmuxNewSessionCommand(psmuxCommand, params.monitorSessionId, dashboardCommand))
         sharedSession.dashboard = await createWindowsPsmuxDashboard(
           params.monitorSessionId,
           psmuxCommand,
@@ -659,16 +666,9 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
     }
   }
 
-  async function renderSharedSessionDashboard(session: SharedPsmuxSession): Promise<void> {
-    const jobs = session.dashboard.metadata.highlightedJobIds
-      .map((jobId) => sharedJobs.get(jobId))
-      .filter((state): state is WindowsPsmuxState => state !== undefined)
-
-    await runPsmuxCommand(buildWindowsPsmuxSendKeysCommand(
-      session.psmuxCommand,
-      session.dashboard.panes.dashboard.target,
-      buildWindowsPsmuxDashboardControlCenterCommand(session, jobs),
-    ))
+  async function renderSharedSessionDashboard(_session: SharedPsmuxSession): Promise<void> {
+    // Dashboard rendering is driven by the dedicated dashboard process
+    // which polls the snapshot file. Snapshot file writing is wired in Task 4.
   }
 
   async function readSharedJobTranscriptDelta(
@@ -840,8 +840,8 @@ function buildWindowsPsmuxSendKeysCommand(psmuxCommand: string, target: string, 
   return `${psmuxCommand} send-keys -t ${target} '${escapeWindowsPsmuxPowerShellString(text)}' Enter`
 }
 
-function buildWindowsPsmuxNewSessionCommand(psmuxCommand: string, sessionId: string, shell: string): string {
-  return `${psmuxCommand} new-session -d -s ${sessionId} -n dashboard -- ${shell} -NoLogo -NoProfile`
+function buildWindowsPsmuxNewSessionCommand(psmuxCommand: string, sessionId: string, dashboardCommand: string): string {
+  return `${psmuxCommand} new-session -d -s ${sessionId} -n dashboard -- ${dashboardCommand}`
 }
 
 function buildWindowsPsmuxDashboardShellSplitCommand(psmuxCommand: string, target: string, shell: string): string {
@@ -1079,6 +1079,14 @@ function buildWindowsPsmuxAutoOpenCommand(attachCommand: string, cwd?: string): 
   return `Start-Process -FilePath powershell.exe${workingDirectory} -ArgumentList '-NoExit','-Command','${escapeWindowsPsmuxPowerShellString(attachCommand)}'`
 }
 
+
+export function buildWindowsPsmuxDashboardSnapshotPath(logDirectory: string, sessionId: string): string {
+  return normalizeWindowsPsmuxPath(join(logDirectory, `${sessionId}-dashboard.json`))
+}
+
+function buildDefaultDashboardProcessCommand(snapshotPath: string): string {
+  return `node -e "const fs=require('fs');const P=500;const S=['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];const A={r:'\\x1b[0m',b:'\\x1b[1m',d:'\\x1b[2m',c:'\\x1b[36m',g:'\\x1b[32m',e:'\\x1b[31m',y:'\\x1b[33m',l:'\\x1b[34m',w:'\\x1b[37m',x:'\\x1b[90m'};let lv=-1,f=0,ls=null;function sm(s,f){if(s==='running')return A.c+S[f%S.length]+A.r;if(s==='completed')return A.g+'✓'+A.r;if(s==='failed')return A.e+'✗'+A.r;return A.y+'■'+A.r}function sc(s){if(s==='running')return A.w;if(s==='completed')return A.g;if(s==='failed')return A.e;return A.y}function sep(){return A.x+'─'.repeat(40)+A.r}function render(sn,f){const l=['','  '+A.b+A.c+sn.title+A.r,'  '+A.x+'Session: '+A.w+sn.sessionId+A.r,'',sep()];if(!sn.jobs||sn.jobs.length===0){l.push('','  '+A.d+'No delegated jobs yet. Waiting for work...'+A.r,'')}else{l.push('','  '+A.b+'Delegated Jobs'+A.r,'');for(const j of sn.jobs){const lb=j.label?' '+A.x+'('+j.label+')'+A.r:'';l.push('  '+sm(j.status,f)+' '+sc(j.status)+j.id+A.r+' '+A.d+'['+j.backend+']'+A.r+' -> '+A.l+'window '+j.windowIndex+A.r+lb)}l.push('')}l.push(sep(),'');if(sn.navigation)for(const h of sn.navigation)l.push('  '+A.x+h+A.r);l.push('');process.stdout.write('\\x1b[2J\\x1b[H'+l.join('\\n'))}function tick(){f++;try{const raw=fs.readFileSync('${snapshotPath.replace(/'/g, "\\'")}','utf8');const sn=JSON.parse(raw);ls=sn;const hr=sn.jobs&&sn.jobs.some(j=>j.status==='running');if(sn.version!==lv||hr){render(sn,f);lv=sn.version}}catch(e){if(ls){render(ls,f)}else{process.stdout.write('\\x1b[2J\\x1b[H\\n  '+A.d+'Waiting for dashboard data...'+A.r+'\\n')}}}tick();setInterval(tick,P)"`
+}
 
 async function loadWindowsPtyRuntime(options: WindowsPtyRuntimeOptions): Promise<Runtime> {
   const { createWindowsPtyRuntime } = await import("./windows-pty.js")

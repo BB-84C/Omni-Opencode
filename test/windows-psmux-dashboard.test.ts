@@ -283,7 +283,7 @@ describe("Windows psmux dashboard layout", () => {
     expect(job.monitor.attachCommand).toBe(`${binaryPath} attach -t parent-session-1`)
   })
 
-  it("renders dashboard guidance and highlighted jobs inline in the left dashboard pane", async () => {
+  it("does not send dashboard content via send-keys since the dashboard process is file-driven", async () => {
     const runPsmuxCommand = vi.fn<(command: string) => Promise<void>>(async () => undefined)
     const hasSharedSession = vi.fn(async () => false)
     hasSharedSession.mockResolvedValueOnce(false)
@@ -303,6 +303,7 @@ describe("Windows psmux dashboard layout", () => {
       runPsmuxCommand,
       hasSharedSession,
       runPsmuxQuery,
+      buildDashboardProcessCommand: (snapshotPath) => `node --dashboard-process "${snapshotPath}"`,
     })
 
     await runtime.start({
@@ -317,19 +318,13 @@ describe("Windows psmux dashboard layout", () => {
     })
 
     const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
-    const leftPaneRender = findLatestSendKeysCommand(commands, "%11")
+    const sendKeysCommands = commands.filter((command) => command.includes("send-keys -t"))
 
-    expect(leftPaneRender).toBeDefined()
-    expect(leftPaneRender).toContain("Session: parent-session-1")
-    expect(leftPaneRender).toContain("Window 0: dashboard")
-    expect(leftPaneRender).toContain("Do not run psmux attach inside this shared session.")
-    expect(leftPaneRender).toContain("Delegated jobs:")
-    expect(leftPaneRender).toContain("runtime-1 [codex] -> window 1")
-    expect(leftPaneRender).toContain("runtime-2 [claude-code] -> window 2")
+    expect(sendKeysCommands).toEqual([])
     expect(commands.filter((command) => command.includes("send-keys -t %12"))).toEqual([])
   })
 
-  it("renders only the latest two jobs inline in the left dashboard pane instead of separate highlight panes", async () => {
+  it("does not send keys to any pane even with multiple jobs", async () => {
     const runPsmuxCommand = vi.fn<(command: string) => Promise<void>>(async () => undefined)
     const hasSharedSession = vi.fn(async () => false)
     hasSharedSession.mockResolvedValueOnce(false)
@@ -355,6 +350,7 @@ describe("Windows psmux dashboard layout", () => {
       runPsmuxCommand,
       hasSharedSession,
       runPsmuxQuery,
+      buildDashboardProcessCommand: (snapshotPath) => `node --dashboard-process "${snapshotPath}"`,
     })
 
     await runtime.start({
@@ -374,16 +370,10 @@ describe("Windows psmux dashboard layout", () => {
     })
 
     const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
-    const dashboardRenderCommand = findLatestSendKeysCommand(commands, "%11")
     const sendKeysCommands = commands.filter((command) => command.includes("send-keys -t"))
 
-    expect(sendKeysCommands.length).toBeGreaterThan(0)
-    expect(sendKeysCommands.every((command) => command.includes("send-keys -t %11"))).toBe(true)
-    expect(dashboardRenderCommand).toBeDefined()
+    expect(sendKeysCommands).toEqual([])
     expect(commands.filter((command) => command.includes("send-keys -t %12"))).toEqual([])
-    expect(dashboardRenderCommand).not.toContain("runtime-1 [codex] -> window 1")
-    expect(dashboardRenderCommand).toContain("runtime-2 [claude-code] -> window 2")
-    expect(dashboardRenderCommand).toContain("runtime-3 [codex] -> window 3")
     expect(commands.filter((command) => command.includes("send-keys -t %13"))).toEqual([])
   })
 

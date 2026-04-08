@@ -110,6 +110,10 @@ function createManagedInstallResult(binaryPath = MANAGED_BINARY_PATH) {
   }
 }
 
+function stubDashboardProcessCommand(snapshotPath: string): string {
+  return `node --dashboard-process "${snapshotPath}"`
+}
+
 const CUSTOM_MANAGED_BINARY_PATH = "D:/custom-tools/psmux.exe"
 
 function createStubRuntime(mode: "pty" | "tmux"): Runtime {
@@ -245,6 +249,7 @@ describe("Windows psmux runtime contract", () => {
       hasSharedSession: async () => false,
       runPsmuxCommand,
       runPsmuxQuery,
+      buildDashboardProcessCommand: stubDashboardProcessCommand,
     })
 
     const firstJob = await runtime.start({
@@ -267,7 +272,7 @@ describe("Windows psmux runtime contract", () => {
     expect(secondJob.monitor.sessionId).toBe("parent-session-1")
     const commands = (runPsmuxCommand.mock.calls as unknown as Array<[string]>).map(([command]) => command)
     expect(commands).toContain(`${MANAGED_BINARY_PATH} start-server`)
-    expectCommandContaining(commands, `${MANAGED_BINARY_PATH} new-session -d -s parent-session-1 -n dashboard -- powershell.exe`)
+    expectCommandContaining(commands, `${MANAGED_BINARY_PATH} new-session -d -s parent-session-1 -n dashboard -- node --dashboard-process`)
   })
 
   it("bootstraps the first shared launch from a real detached session without recreating the dashboard window", async () => {
@@ -282,6 +287,7 @@ describe("Windows psmux runtime contract", () => {
       hasSharedSession,
       runPsmuxCommand,
       runPsmuxQuery,
+      buildDashboardProcessCommand: stubDashboardProcessCommand,
     })
 
     const job = await runtime.start({
@@ -295,7 +301,7 @@ describe("Windows psmux runtime contract", () => {
     expect(hasSharedSession).toHaveBeenCalledOnce()
     expect(hasSharedSession).toHaveBeenCalledWith("parent-session-bootstrap")
     expect(recordedCommands[0]).toBe(`${MANAGED_BINARY_PATH} start-server`)
-    expect(recordedCommands[1]).toContain(`${MANAGED_BINARY_PATH} new-session -d -s parent-session-bootstrap -n dashboard -- powershell.exe`)
+    expect(recordedCommands[1]).toContain(`${MANAGED_BINARY_PATH} new-session -d -s parent-session-bootstrap -n dashboard -- node --dashboard-process`)
     expect(recordedCommands).not.toContain(
       `${MANAGED_BINARY_PATH} new-window -t parent-session-bootstrap -n dashboard`,
     )
@@ -303,7 +309,7 @@ describe("Windows psmux runtime contract", () => {
     expect(job.monitor.attachCommand).toBe(`${MANAGED_BINARY_PATH} attach -t parent-session-bootstrap`)
   })
 
-  it("creates the detached dashboard session with a real interactive shell, not a sleep loop", async () => {
+  it("creates the detached dashboard session with a dedicated dashboard process, not a shell", async () => {
     const runPsmuxCommand = vi.fn(async () => undefined)
     const runPsmuxQuery = createDashboardQueryStub()
 
@@ -314,6 +320,7 @@ describe("Windows psmux runtime contract", () => {
       hasSharedSession: async () => false,
       runPsmuxCommand,
       runPsmuxQuery,
+      buildDashboardProcessCommand: stubDashboardProcessCommand,
     })
 
     await runtime.start({
@@ -326,12 +333,12 @@ describe("Windows psmux runtime contract", () => {
     const newSessionCommand = commands.find((command) => command.includes("new-session -d -s parent-session-shell-bootstrap -n dashboard --"))
 
     expect(newSessionCommand).toBeDefined()
-    expect(newSessionCommand).toContain("powershell.exe -NoLogo -NoProfile")
+    expect(newSessionCommand).toContain("node --dashboard-process")
+    expect(newSessionCommand).not.toContain("powershell.exe -NoLogo -NoProfile")
     expect(newSessionCommand).not.toContain("Start-Sleep")
-    expect(newSessionCommand).not.toContain("while ($true)")
   })
 
-  it("keeps window 0 as a two-pane dashboard with a runtime-owned left pane and interactive shell on the right", async () => {
+  it("keeps window 0 as a two-pane dashboard with a dedicated dashboard process on the left and interactive shell on the right", async () => {
     const runPsmuxCommand = vi.fn(async () => undefined)
     const runPsmuxQuery = createTwoPaneDashboardQueryStub()
 
@@ -342,6 +349,7 @@ describe("Windows psmux runtime contract", () => {
       hasSharedSession: async () => false,
       runPsmuxCommand,
       runPsmuxQuery,
+      buildDashboardProcessCommand: stubDashboardProcessCommand,
     })
 
     await runtime.start({
@@ -355,14 +363,14 @@ describe("Windows psmux runtime contract", () => {
     const newSessionCommand = commands.find((command) => command.includes("new-session -d -s parent-session-two-pane-shell -n dashboard --"))
 
     expect(splitCommands).toHaveLength(1)
-    expect(newSessionCommand).toContain("powershell.exe -NoLogo -NoProfile")
+    expect(newSessionCommand).toContain("node --dashboard-process")
     expect(splitCommands[0]).toContain("-- powershell.exe -NoLogo -NoProfile")
     expect(commands).not.toContain(
       `${MANAGED_BINARY_PATH} split-window -t parent-session-two-pane-shell:dashboard.1 -v -p 50 -d`,
     )
   })
 
-  it("keeps the right dashboard pane as a shell across dashboard refreshes", async () => {
+  it("never sends keys to the dashboard or shell panes since the dashboard process is file-driven", async () => {
     const runPsmuxCommand = vi.fn(async () => undefined)
     const runPsmuxQuery = createTwoPaneDashboardQueryStub()
 
@@ -373,6 +381,7 @@ describe("Windows psmux runtime contract", () => {
       hasSharedSession: async () => false,
       runPsmuxCommand,
       runPsmuxQuery,
+      buildDashboardProcessCommand: stubDashboardProcessCommand,
     })
 
     await runtime.start({
@@ -389,14 +398,14 @@ describe("Windows psmux runtime contract", () => {
 
     const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
     const splitCommands = commands.filter((command) => command.includes("split-window -t parent-session-shell-refresh:dashboard"))
-    const dashboardRenders = commands.filter((command) => command.includes("send-keys -t %11"))
-    const shellRenders = commands.filter((command) => command.includes("send-keys -t %12"))
+    const dashboardSendKeys = commands.filter((command) => command.includes("send-keys -t %11"))
+    const shellSendKeys = commands.filter((command) => command.includes("send-keys -t %12"))
 
     expect(splitCommands).toEqual([
       `${MANAGED_BINARY_PATH} split-window -t parent-session-shell-refresh:dashboard -h -p 35 -d -- powershell.exe -NoLogo -NoProfile`,
     ])
-    expect(dashboardRenders.length).toBeGreaterThan(1)
-    expect(shellRenders).toEqual([])
+    expect(dashboardSendKeys).toEqual([])
+    expect(shellSendKeys).toEqual([])
   })
 
   it("keeps reusing the live cached shared session while this process still tracks active jobs", async () => {
@@ -455,6 +464,7 @@ describe("Windows psmux runtime contract", () => {
       ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
       runShellCommand,
       runPsmuxQuery,
+      buildDashboardProcessCommand: stubDashboardProcessCommand,
     })
 
     const job = await runtime.start({
@@ -471,7 +481,7 @@ describe("Windows psmux runtime contract", () => {
       2,
       `${MANAGED_BINARY_PATH} start-server`,
     )
-    expect(String(runShellCommand.mock.calls[2]?.[0] ?? "")).toContain(`${MANAGED_BINARY_PATH} new-session -d -s parent-session-default-path -n dashboard -- powershell.exe`)
+    expect(String(runShellCommand.mock.calls[2]?.[0] ?? "")).toContain(`${MANAGED_BINARY_PATH} new-session -d -s parent-session-default-path -n dashboard -- node --dashboard-process`)
     expect(job.monitor.attachCommand).toBe(`${MANAGED_BINARY_PATH} attach -t parent-session-default-path`)
   })
 
@@ -1106,6 +1116,7 @@ describe("Windows psmux runtime contract", () => {
       hasSharedSession,
       runPsmuxCommand,
       runPsmuxQuery,
+      buildDashboardProcessCommand: stubDashboardProcessCommand,
     })
 
     const job = await runtime.start({
@@ -1118,8 +1129,9 @@ describe("Windows psmux runtime contract", () => {
     expect(hasSharedSession).toHaveBeenCalledTimes(1)
     expect(runPsmuxCommand).toHaveBeenCalledWith(`${MANAGED_BINARY_PATH} kill-session -t parent-session-old-layout`)
     expect(runPsmuxCommand).toHaveBeenCalledWith(`${MANAGED_BINARY_PATH} start-server`)
-    expect(runPsmuxCommand).toHaveBeenCalledWith(
-      `${MANAGED_BINARY_PATH} new-session -d -s parent-session-old-layout -n dashboard -- powershell.exe -NoLogo -NoProfile`,
+    expectCommandContaining(
+      runPsmuxCommand.mock.calls.map(([command]) => command),
+      `${MANAGED_BINARY_PATH} new-session -d -s parent-session-old-layout -n dashboard -- node --dashboard-process`,
     )
     expect(runPsmuxCommand).toHaveBeenCalledWith(
       `${MANAGED_BINARY_PATH} split-window -t parent-session-old-layout:dashboard -h -p 35 -d -- powershell.exe -NoLogo -NoProfile`,
@@ -1156,9 +1168,7 @@ describe("Windows psmux runtime contract", () => {
     expect(hasSharedSession).toHaveBeenCalledTimes(1)
     expect(runPsmuxCommand).not.toHaveBeenCalledWith(`${MANAGED_BINARY_PATH} kill-session -t parent-session-query-failure`)
     expect(runPsmuxCommand).not.toHaveBeenCalledWith(`${MANAGED_BINARY_PATH} start-server`)
-    expect(runPsmuxCommand).not.toHaveBeenCalledWith(
-      `${MANAGED_BINARY_PATH} new-session -d -s parent-session-query-failure -n dashboard -- powershell.exe -NoLogo -NoProfile`,
-    )
+    expect(runPsmuxCommand.mock.calls.map(([c]) => c).filter((c: string) => c.includes("new-session -d -s parent-session-query-failure"))).toEqual([])
   })
 
   it("bubbles invalid dashboard discovery output without recreating the shared session", async () => {
@@ -1189,9 +1199,7 @@ describe("Windows psmux runtime contract", () => {
     expect(hasSharedSession).toHaveBeenCalledTimes(1)
     expect(runPsmuxCommand).not.toHaveBeenCalledWith(`${MANAGED_BINARY_PATH} kill-session -t parent-session-invalid-discovery`)
     expect(runPsmuxCommand).not.toHaveBeenCalledWith(`${MANAGED_BINARY_PATH} start-server`)
-    expect(runPsmuxCommand).not.toHaveBeenCalledWith(
-      `${MANAGED_BINARY_PATH} new-session -d -s parent-session-invalid-discovery -n dashboard -- powershell.exe -NoLogo -NoProfile`,
-    )
+    expect(runPsmuxCommand.mock.calls.map(([c]) => c).filter((c: string) => c.includes("new-session -d -s parent-session-invalid-discovery"))).toEqual([])
   })
 
   it("does not discard a live cached shared session just because one has-session probe says false", async () => {
