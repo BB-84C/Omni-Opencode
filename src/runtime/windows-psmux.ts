@@ -477,6 +477,7 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
       params.command,
       psmuxCommand,
       runPsmuxQuery,
+      runPsmuxCommand,
     )
     await configureWindowsPsmuxPipePaneBookkeeping(logDirectory, executionWindow.paneTarget, transcriptLogPath, psmuxCommand, runPsmuxCommand)
     const monitor: RuntimeMonitor = {
@@ -823,6 +824,7 @@ async function createWindowsPsmuxJobExecutionTarget(
   command: string,
   psmuxCommand: string,
   runPsmuxQuery: (command: string) => Promise<string> | string,
+  runPsmuxCommand: (command: string) => Promise<void> | void,
 ): Promise<WindowsPsmuxExecutionWindow> {
   const executionWindows = parseWindowsPsmuxExecutionWindows(
     await runPsmuxQuery(buildWindowsPsmuxNewWindowCaptureCommand(psmuxCommand, sessionId, jobId, command)),
@@ -833,9 +835,11 @@ async function createWindowsPsmuxJobExecutionTarget(
   }
 
   const executionWindow = executionWindows[0]!
+  const windowTarget = `${sessionId}:${executionWindow.index}`
+  await runPsmuxCommand(`${psmuxCommand} set-option -t ${windowTarget} remain-on-exit on`)
   return {
     ...executionWindow,
-    target: `${sessionId}:${executionWindow.index}`,
+    target: windowTarget,
   }
 }
 
