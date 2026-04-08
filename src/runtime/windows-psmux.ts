@@ -475,6 +475,7 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
       params.monitorSessionId,
       id,
       params.command,
+      shell,
       psmuxCommand,
       runPsmuxQuery,
       runPsmuxCommand,
@@ -822,12 +823,13 @@ async function createWindowsPsmuxJobExecutionTarget(
   sessionId: string,
   jobId: string,
   command: string,
+  shell: string,
   psmuxCommand: string,
   runPsmuxQuery: (command: string) => Promise<string> | string,
   runPsmuxCommand: (command: string) => Promise<void> | void,
 ): Promise<WindowsPsmuxExecutionWindow> {
   const executionWindows = parseWindowsPsmuxExecutionWindows(
-    await runPsmuxQuery(buildWindowsPsmuxNewWindowCaptureCommand(psmuxCommand, sessionId, jobId, command)),
+    await runPsmuxQuery(buildWindowsPsmuxNewWindowShellCommand(psmuxCommand, sessionId, jobId, shell)),
   )
 
   if (executionWindows.length !== 1) {
@@ -837,6 +839,7 @@ async function createWindowsPsmuxJobExecutionTarget(
   const executionWindow = executionWindows[0]!
   const windowTarget = `${sessionId}:${executionWindow.index}`
   await runPsmuxCommand(`${psmuxCommand} set-option -t ${windowTarget} remain-on-exit on`)
+  await runPsmuxCommand(buildWindowsPsmuxSendKeysCommand(psmuxCommand, executionWindow.paneTarget, buildWindowsPsmuxWrappedCommand(command)))
   return {
     ...executionWindow,
     target: windowTarget,
@@ -1053,13 +1056,13 @@ function buildWindowsPsmuxListPanesCommand(psmuxCommand: string, target: string)
   return `${psmuxCommand} list-panes -t ${target} -F "#{pane_id} #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{pane_height}"`
 }
 
-function buildWindowsPsmuxNewWindowCaptureCommand(
+function buildWindowsPsmuxNewWindowShellCommand(
   psmuxCommand: string,
   sessionId: string,
   jobId: string,
-  command: string,
+  shell: string,
 ): string {
-  return `${psmuxCommand} new-window -P -F "#{window_index} #{pane_id}" -t ${sessionId} -n job-${jobId} -d -- ${buildWindowsPsmuxWrappedCommand(command)}`
+  return `${psmuxCommand} new-window -P -F "#{window_index} #{pane_id}" -t ${sessionId} -n job-${jobId} -d -- ${shell} -NoLogo -NoProfile`
 }
 
 function buildWindowsPsmuxAttachCommand(psmuxCommand: string, sessionId: string): string {

@@ -182,7 +182,7 @@ describe("Windows psmux dashboard layout", () => {
     expect(runPsmuxQuery.mock.calls.filter(([command]) => command.includes(`list-panes -t ${sessionId}:dashboard`))).toHaveLength(1)
     const queryCommands = runPsmuxQuery.mock.calls.map(([command]) => command)
     expectCommandContaining(queryCommands, `${binaryPath} new-window -P -F "#{window_index} #{pane_id}" -t ${sessionId} -n job-runtime-1 -d -- powershell.exe`)
-    expectCommandContaining(queryCommands, 'codex exec "hello"')
+    expectCommandContaining(commands, 'codex exec "hello"')
   })
 
   it("derives left and right dashboard roles from real pane geometry", () => {
@@ -318,13 +318,15 @@ describe("Windows psmux dashboard layout", () => {
     })
 
     const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
-    const sendKeysCommands = commands.filter((command) => command.includes("send-keys -t"))
+    const dashboardSendKeys = commands.filter((command) => command.includes("send-keys -t %11") || command.includes("send-keys -t %12"))
 
-    expect(sendKeysCommands).toEqual([])
-    expect(commands.filter((command) => command.includes("send-keys -t %12"))).toEqual([])
+    expect(dashboardSendKeys).toEqual([])
+    // Job panes receive send-keys for agent commands
+    expect(commands.filter((command) => command.includes("send-keys -t %31"))).toHaveLength(1)
+    expect(commands.filter((command) => command.includes("send-keys -t %41"))).toHaveLength(1)
   })
 
-  it("does not send keys to any pane even with multiple jobs", async () => {
+  it("does not send keys to dashboard panes even with multiple jobs", async () => {
     const runPsmuxCommand = vi.fn<(command: string) => Promise<void>>(async () => undefined)
     const hasSharedSession = vi.fn(async () => false)
     hasSharedSession.mockResolvedValueOnce(false)
@@ -370,11 +372,13 @@ describe("Windows psmux dashboard layout", () => {
     })
 
     const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
-    const sendKeysCommands = commands.filter((command) => command.includes("send-keys -t"))
+    const dashboardSendKeys = commands.filter((command) => command.includes("send-keys -t %11") || command.includes("send-keys -t %12") || command.includes("send-keys -t %13"))
 
-    expect(sendKeysCommands).toEqual([])
-    expect(commands.filter((command) => command.includes("send-keys -t %12"))).toEqual([])
-    expect(commands.filter((command) => command.includes("send-keys -t %13"))).toEqual([])
+    expect(dashboardSendKeys).toEqual([])
+    // Job panes receive send-keys for agent commands
+    expect(commands.filter((command) => command.includes("send-keys -t %31"))).toHaveLength(1)
+    expect(commands.filter((command) => command.includes("send-keys -t %41"))).toHaveLength(1)
+    expect(commands.filter((command) => command.includes("send-keys -t %51"))).toHaveLength(1)
   })
 
   it("starts each delegated job in its own real execution window instead of treating dashboard slots as canonical homes", async () => {
@@ -418,9 +422,10 @@ describe("Windows psmux dashboard layout", () => {
     const dashboardListPaneCommands = queryCommands.filter((command) => command.includes('list-panes -t parent-session-1:dashboard -F "#{pane_id} #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{pane_height}"'))
 
     expect(newWindowCommands[0]).toContain('psmux new-window -P -F "#{window_index} #{pane_id}" -t parent-session-1 -n job-runtime-1 -d -- powershell.exe')
-    expect(newWindowCommands[0]).toContain('codex exec "alpha"')
     expect(newWindowCommands[1]).toContain('psmux new-window -P -F "#{window_index} #{pane_id}" -t parent-session-1 -n job-runtime-2 -d -- powershell.exe')
-    expect(newWindowCommands[1]).toContain('claude --print "beta"')
+    // Agent commands are sent via send-keys to the job panes, not embedded in new-window
+    expectCommandContaining(commands, 'codex exec "alpha"')
+    expectCommandContaining(commands, 'claude --print "beta"')
     expect(dashboardSplitCommands).toEqual([
       'psmux split-window -t parent-session-1:dashboard -h -p 35 -d -- powershell.exe -NoLogo -NoProfile',
     ])
