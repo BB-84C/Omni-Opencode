@@ -55,16 +55,29 @@ The dashboard window is the default attach landing point.
 
 ## Dashboard Window
 
-The dashboard can still have a useful pane layout, but it is no longer a live pane compositor for agent sessions.
+The dashboard is a two-pane window `0`:
+
+- **Left pane:** a dedicated long-lived dashboard process (not a shell)
+- **Right pane:** a normal interactive PowerShell shell
+
+The left pane runs a Node.js process that polls a session-local JSON snapshot file and renders ANSI-styled status content. It never shows a shell prompt.
+
+The dashboard process is file-driven:
+
+- the plugin/runtime writes a snapshot file when job state changes
+- the dashboard process detects version changes and redraws
+- no `send-keys` rendering is used
 
 Its role is:
 
-- control/index window
-- list all delegated jobs
-- highlight the latest two jobs
-- provide navigation hints for switching to real job windows
+- control/index surface for the session
+- list all delegated jobs with status markers (running/completed/failed/stopped)
+- animated spinners for running jobs
+- navigation hints for switching to real job windows
 
 It should not attempt to mirror or embed the actual agent terminal into dashboard panes.
+
+If the dashboard process exits unexpectedly, the runtime respawns it via `respawn-pane` without disturbing the right-pane shell or job windows.
 
 ## Agent Windows
 
@@ -162,23 +175,21 @@ Do not call the revised Windows `psmux` model complete unless a live session pro
 
 ## Current Implementation State
 
-As of this session:
+As of 2026-04-08:
 
-- the codebase has already been refactored substantially toward the multi-window model
-- Tasks 1 through 6 of the implementation plan are complete locally
-- automated verification is green:
-  - `35` test files
-  - `283` tests
+- the multi-window model is fully implemented and committed
+- the dashboard process model replaces the shell-backed left pane:
+  - dedicated dashboard process in left pane (not PowerShell)
+  - session-local snapshot file drives the dashboard display
+  - ANSI-styled rendering with color, spinners, and status markers
+  - `respawn-pane` recovery for the dashboard process
+- focused verification is green:
+  - `5` focused test files
+  - `101` tests
   - `0` failures
 - build is green
 
-Remaining work is Task 7: live Windows verification of the plugin-managed multi-window `psmux` path.
-
-Important:
-
-- no git commit has been created for this work yet
-- managed `psmux` installation is implemented
-- the remaining unknowns are user-visible live plugin behavior details, not fundamental `psmux` capability
+Remaining work is live Windows UI verification.
 
 ## Keep / Archive
 

@@ -161,6 +161,19 @@ Live verification must prove:
 - `docs/plans/2026-04-07-omni-opencode-psmux-multi-window-design.md`
 - `docs/plans/2026-04-07-omni-opencode-psmux-multi-window-implementation.md`
 
-## Notes
+## Implementation Status
 
-No git commit has been created for this design document yet.
+Implemented as of 2026-04-08. Key files created:
+
+- `src/runtime/windows-dashboard-snapshot.ts` — snapshot contract types and builder
+- `src/runtime/windows-dashboard-renderer.ts` — ANSI dashboard renderer
+- `src/runtime/windows-dashboard-process.ts` — dashboard process entry point and inline command builder
+- `test/windows-dashboard-process.test.ts` — 24 tests covering snapshot, renderer, and file writes
+
+Key changes to existing files:
+
+- `src/runtime/windows-psmux.ts` — new-session launches dashboard process, snapshot file writes on state changes, `respawn-pane` recovery
+- `test/windows-psmux.test.ts` — updated to verify dashboard process launch and recovery
+- `test/windows-psmux-dashboard.test.ts` — updated to verify no send-keys rendering
+
+Verified: 101 focused tests pass, build succeeds.

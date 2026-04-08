@@ -12,7 +12,7 @@
 
 ## Current Progress
 
-The following tasks are already complete in the current workspace state:
+All multi-window implementation tasks are complete. Additionally, the dashboard has been upgraded from a shell-backed rendering model to a dedicated dashboard process model:
 
 - Task 1: lock the multi-window model in tests
 - Task 2: remove embedded slot movement from runtime
@@ -20,24 +20,23 @@ The following tasks are already complete in the current workspace state:
 - Task 4: rewire plugin attach / switch semantics
 - Task 5: dashboard metadata for latest two jobs
 - Task 6: full regression verification
+- **Dashboard process upgrade (2026-04-08):**
+  - Defined session-local dashboard snapshot contract
+  - Built ANSI dashboard renderer with color/spinners
+  - Launched dedicated dashboard process in left pane
+  - Wired snapshot file writes on job state transitions
+  - Added dashboard process recovery via `respawn-pane`
 
 Verified status at this checkpoint:
 
-- focused multi-window `psmux` suites are green
-- full suite is green (`35` files, `283` tests, `0` failures)
+- focused psmux suites are green (`5` files, `101` tests, `0` failures)
 - `npm run build` is green
 
 The remaining task is:
 
 - Task 7: live Windows verification
 
-Important manual findings from the work leading up to this checkpoint:
-
-- real detached `psmux` sessions work
-- real dashboard 3-pane layouts work
-- real interactive Codex and Claude windows work in the same `psmux` session
-- switching between those windows works with native `psmux` window navigation
-- the embedded-pane dashboard model was rejected in favor of the multi-window model
+The dashboard model is now: left pane runs a dedicated Node.js process that polls a session-local JSON snapshot file and renders ANSI-styled status. No shell prompt appears in the left pane. The right pane remains an interactive PowerShell shell.
 
 ### Task 1: Lock The Multi-Window Model In Tests
 
