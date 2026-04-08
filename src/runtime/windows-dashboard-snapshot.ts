@@ -37,6 +37,7 @@ export function buildDashboardSnapshot(input: BuildDashboardSnapshotInput): Dash
     navigation: [
       "Use Ctrl+b then n/p to cycle windows.",
       "Use Ctrl+b then 0 to return here.",
+      "Do not run psmux attach inside this shared session.",
     ],
     version: ++snapshotVersion,
   }
