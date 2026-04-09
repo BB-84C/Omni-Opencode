@@ -181,8 +181,8 @@ describe("Windows psmux dashboard layout", () => {
     expect(runPsmuxQuery).toHaveBeenNthCalledWith(1, `${binaryPath} list-panes -t ${sessionId}:dashboard -F "#{pane_id} #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{pane_height}"`)
     expect(runPsmuxQuery.mock.calls.filter(([command]) => command.includes(`list-panes -t ${sessionId}:dashboard`))).toHaveLength(1)
     const queryCommands = runPsmuxQuery.mock.calls.map(([command]) => command)
-    expectCommandContaining(queryCommands, `${binaryPath} new-window -P -F "#{window_index} #{pane_id}" -t ${sessionId} -n job-runtime-1 -d -- powershell.exe`)
-    expectCommandContaining(commands, 'codex exec "hello"')
+    expectCommandContaining(queryCommands, `${binaryPath} new-window -P -F "#{window_index} #{pane_id}" -t ${sessionId} -n job-runtime-1 -d -- powershell.exe -NoLogo -NoProfile -File`)
+    expectCommandContaining(queryCommands, 'runtime-1.ps1')
   })
 
   it("derives left and right dashboard roles from real pane geometry", () => {
@@ -321,12 +321,12 @@ describe("Windows psmux dashboard layout", () => {
     const dashboardSendKeys = commands.filter((command) => command.includes("send-keys -t %11") || command.includes("send-keys -t %12"))
 
     expect(dashboardSendKeys).toEqual([])
-    // Job panes receive send-keys for agent commands
-    expect(commands.filter((command) => command.includes("send-keys -t %31"))).toHaveLength(1)
-    expect(commands.filter((command) => command.includes("send-keys -t %41"))).toHaveLength(1)
+    // No send-keys to job panes either — agent commands run via script files
+    expect(commands.filter((command) => command.includes("send-keys -t %31"))).toEqual([])
+    expect(commands.filter((command) => command.includes("send-keys -t %41"))).toEqual([])
   })
 
-  it("does not send keys to dashboard panes even with multiple jobs", async () => {
+  it("does not send keys to any pane even with multiple jobs", async () => {
     const runPsmuxCommand = vi.fn<(command: string) => Promise<void>>(async () => undefined)
     const hasSharedSession = vi.fn(async () => false)
     hasSharedSession.mockResolvedValueOnce(false)
@@ -375,10 +375,9 @@ describe("Windows psmux dashboard layout", () => {
     const dashboardSendKeys = commands.filter((command) => command.includes("send-keys -t %11") || command.includes("send-keys -t %12") || command.includes("send-keys -t %13"))
 
     expect(dashboardSendKeys).toEqual([])
-    // Job panes receive send-keys for agent commands
-    expect(commands.filter((command) => command.includes("send-keys -t %31"))).toHaveLength(1)
-    expect(commands.filter((command) => command.includes("send-keys -t %41"))).toHaveLength(1)
-    expect(commands.filter((command) => command.includes("send-keys -t %51"))).toHaveLength(1)
+    expect(commands.filter((command) => command.includes("send-keys -t %31"))).toEqual([])
+    expect(commands.filter((command) => command.includes("send-keys -t %41"))).toEqual([])
+    expect(commands.filter((command) => command.includes("send-keys -t %51"))).toEqual([])
   })
 
   it("starts each delegated job in its own real execution window instead of treating dashboard slots as canonical homes", async () => {
@@ -421,11 +420,10 @@ describe("Windows psmux dashboard layout", () => {
     const dashboardSplitCommands = commands.filter((command) => command.includes("split-window -t parent-session-1:dashboard") || command.includes("split-window -t parent-session-1:dashboard.1 -v -p 50 -d"))
     const dashboardListPaneCommands = queryCommands.filter((command) => command.includes('list-panes -t parent-session-1:dashboard -F "#{pane_id} #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{pane_height}"'))
 
-    expect(newWindowCommands[0]).toContain('psmux new-window -P -F "#{window_index} #{pane_id}" -t parent-session-1 -n job-runtime-1 -d -- powershell.exe')
-    expect(newWindowCommands[1]).toContain('psmux new-window -P -F "#{window_index} #{pane_id}" -t parent-session-1 -n job-runtime-2 -d -- powershell.exe')
-    // Agent commands are sent via send-keys to the job panes, not embedded in new-window
-    expectCommandContaining(commands, 'codex exec "alpha"')
-    expectCommandContaining(commands, 'claude --print "beta"')
+    expect(newWindowCommands[0]).toContain('psmux new-window -P -F "#{window_index} #{pane_id}" -t parent-session-1 -n job-runtime-1 -d -- powershell.exe -NoLogo -NoProfile -File')
+    expect(newWindowCommands[1]).toContain('psmux new-window -P -F "#{window_index} #{pane_id}" -t parent-session-1 -n job-runtime-2 -d -- powershell.exe -NoLogo -NoProfile -File')
+    expect(newWindowCommands[0]).toContain('runtime-1.ps1')
+    expect(newWindowCommands[1]).toContain('runtime-2.ps1')
     expect(dashboardSplitCommands).toEqual([
       'psmux split-window -t parent-session-1:dashboard -h -p 35 -d -- powershell.exe -NoLogo -NoProfile',
     ])

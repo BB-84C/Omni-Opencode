@@ -52,7 +52,6 @@ export type WindowsPsmuxRuntimeOptions = {
   runPsmuxCommand?: (command: string) => Promise<void> | void
   runPsmuxQuery?: (command: string) => Promise<string> | string
   runShellCommand?: (command: string) => Promise<void> | void
-  runPsmuxSendKeys?: (psmuxCommand: string, paneTarget: string, text: string) => Promise<void> | void
   hasSharedSession?: (sessionId: string) => Promise<boolean> | boolean
   open?: (params: {
     jobId: string
@@ -287,10 +286,6 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
   const logDirectory = join(cwd ?? process.cwd(), ".omni-monitors")
   const managedPsmuxPaths = resolveManagedWindowsPsmuxPaths({ cwd, platform, arch })
   const readTranscriptCaptureFile = options.readTranscriptCaptureFile ?? readWindowsPsmuxTranscriptChunk
-  const runPsmuxSendKeys = options.runPsmuxSendKeys
-    ?? (options.runPsmuxCommand || options.runShellCommand
-      ? (psmuxCmd: string, paneTarget: string, text: string) => runPsmuxCommand(buildWindowsPsmuxSendKeysCommand(psmuxCmd, paneTarget, text))
-      : runWindowsPsmuxSendKeysDirect)
   const buildDashboardCommand = options.buildDashboardProcessCommand ?? buildDefaultDashboardProcessCommand
   const sharedJobs = new Map<string, WindowsPsmuxState>()
   const sharedSessions = new Map<string, SharedPsmuxSession>()
@@ -480,11 +475,10 @@ export function createWindowsPsmuxRuntime(options: WindowsPsmuxRuntimeOptions = 
       params.monitorSessionId,
       id,
       params.command,
-      shell,
+      logDirectory,
       psmuxCommand,
       runPsmuxQuery,
       runPsmuxCommand,
-      runPsmuxSendKeys,
     )
     await configureWindowsPsmuxPipePaneBookkeeping(logDirectory, executionWindow.paneTarget, transcriptLogPath, psmuxCommand, runPsmuxCommand)
     const monitor: RuntimeMonitor = {
@@ -829,14 +823,14 @@ async function createWindowsPsmuxJobExecutionTarget(
   sessionId: string,
   jobId: string,
   command: string,
-  shell: string,
+  logDirectory: string,
   psmuxCommand: string,
   runPsmuxQuery: (command: string) => Promise<string> | string,
   runPsmuxCommand: (command: string) => Promise<void> | void,
-  sendKeys: (psmuxCommand: string, paneTarget: string, text: string) => Promise<void> | void,
 ): Promise<WindowsPsmuxExecutionWindow> {
+  const jobScriptPath = await writeJobScript(logDirectory, jobId, command)
   const executionWindows = parseWindowsPsmuxExecutionWindows(
-    await runPsmuxQuery(buildWindowsPsmuxNewWindowShellCommand(psmuxCommand, sessionId, jobId, shell)),
+    await runPsmuxQuery(buildWindowsPsmuxNewWindowJobCommand(psmuxCommand, sessionId, jobId, jobScriptPath)),
   )
 
   if (executionWindows.length !== 1) {
@@ -846,11 +840,27 @@ async function createWindowsPsmuxJobExecutionTarget(
   const executionWindow = executionWindows[0]!
   const windowTarget = `${sessionId}:${executionWindow.index}`
   await runPsmuxCommand(`${psmuxCommand} set-option -t ${windowTarget} remain-on-exit on`)
-  await sendKeys(psmuxCommand, executionWindow.paneTarget, buildWindowsPsmuxJobPaneCommand(command))
   return {
     ...executionWindow,
     target: windowTarget,
   }
+}
+
+async function writeJobScript(logDir: string, jobId: string, command: string): Promise<string> {
+  await mkdir(logDir, { recursive: true })
+  const scriptPath = normalizeWindowsPsmuxPath(join(logDir, `${jobId}.ps1`))
+  const script = `${command}\n$omniExit = if ($global:LASTEXITCODE -ne $null) { $global:LASTEXITCODE } elseif ($?) { 0 } else { 1 }\nWrite-Output "${WINDOWS_PSMUX_EXIT_MARKER}$omniExit"\nexit $omniExit\n`
+  await writeFile(scriptPath, script, "utf8")
+  return scriptPath
+}
+
+function buildWindowsPsmuxNewWindowJobCommand(
+  psmuxCommand: string,
+  sessionId: string,
+  jobId: string,
+  jobScriptPath: string,
+): string {
+  return `${psmuxCommand} new-window -P -F "#{window_index} #{pane_id}" -t ${sessionId} -n job-${jobId} -d -- powershell.exe -NoLogo -NoProfile -File ${jobScriptPath}`
 }
 
 function buildWindowsPsmuxTranscriptLogPath(logDirectory: string, jobId: string): string {
@@ -876,26 +886,6 @@ function buildWindowsPsmuxSendKeysCommand(psmuxCommand: string, target: string, 
   return `${psmuxCommand} send-keys -t ${target} '${escapeWindowsPsmuxPowerShellString(text)}' Enter`
 }
 
-function buildWindowsPsmuxJobPaneCommand(command: string): string {
-  return `${command}; Write-Output "${WINDOWS_PSMUX_EXIT_MARKER}$(if ($global:LASTEXITCODE -ne $null) { $global:LASTEXITCODE } elseif ($?) { 0 } else { 1 })"`
-}
-
-function runWindowsPsmuxSendKeysDirect(psmuxCommand: string, paneTarget: string, text: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawnProcess(psmuxCommand, ["send-keys", "-t", paneTarget, text, "Enter"], {
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    })
-    child.on("error", reject)
-    child.on("close", (exitCode) => {
-      if (exitCode === 0) {
-        resolve()
-        return
-      }
-      reject(new Error(`psmux send-keys failed with exit code ${exitCode}`))
-    })
-  })
-}
 
 function buildWindowsPsmuxNewSessionCommand(psmuxCommand: string, sessionId: string, dashboardCommand: string): string {
   return `${psmuxCommand} new-session -d -s ${sessionId} -n dashboard -- ${dashboardCommand}`
@@ -1084,14 +1074,6 @@ function buildWindowsPsmuxListPanesCommand(psmuxCommand: string, target: string)
   return `${psmuxCommand} list-panes -t ${target} -F "#{pane_id} #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{pane_height}"`
 }
 
-function buildWindowsPsmuxNewWindowShellCommand(
-  psmuxCommand: string,
-  sessionId: string,
-  jobId: string,
-  shell: string,
-): string {
-  return `${psmuxCommand} new-window -P -F "#{window_index} #{pane_id}" -t ${sessionId} -n job-${jobId} -d -- ${shell} -NoLogo -NoProfile`
-}
 
 function buildWindowsPsmuxAttachCommand(psmuxCommand: string, sessionId: string): string {
   return `${psmuxCommand} attach -t ${sessionId}`
