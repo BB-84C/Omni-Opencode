@@ -1,10 +1,14 @@
 import type { DelegatedEvent } from "../core/events.js"
+import type { ClaudeCapabilityPolicy } from "../core/claude-policy.js"
+import type { CodexCapabilityPolicy } from "../core/codex-policy.js"
 
 export type JobStartParams = {
   childSessionId: string
   prompt: string
   cwd?: string
   env?: Record<string, string>
+  policy?: ClaudeCapabilityPolicy
+  codexPolicy?: CodexCapabilityPolicy
 }
 
 export type JobHandle = {

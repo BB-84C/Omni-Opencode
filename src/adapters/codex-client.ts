@@ -1,5 +1,6 @@
 import { spawn } from "child_process"
 import { createInterface } from "readline"
+import type { CodexCapabilityPolicy } from "../core/codex-policy.js"
 
 // ---------------------------------------------------------------------------
 // Real Codex app-server v2 notification types (from `codex app-server generate-ts`)
@@ -29,7 +30,7 @@ export type CodexNotification =
   | { method: "error"; params: { message: string } }
 
 export interface CodexClient {
-  startThread(params: { prompt: string; cwd?: string }): Promise<{ threadId: string }>
+  startThread(params: { prompt: string; cwd?: string; policy?: CodexCapabilityPolicy }): Promise<{ threadId: string }>
   cancelThread(threadId: string): Promise<void>
   subscribeNotifications(threadId: string): AsyncIterable<CodexNotification>
   close(): void
@@ -185,15 +186,15 @@ export function createCodexClient(): CodexClient {
   })
 
   return {
-    async startThread({ prompt, cwd }) {
+    async startThread({ prompt, cwd, policy }) {
       await initPromise
 
       // Create a thread — response is { thread: { id, ... } }
       const threadResult = (await send("thread/start", {
         experimentalRawEvents: false,
         persistExtendedHistory: false,
-        approvalPolicy: "never",
         cwd: cwd ?? null,
+        ...(policy ? { ...policy } : {}),
       })) as { thread: { id: string } }
 
       const threadId = threadResult.thread.id

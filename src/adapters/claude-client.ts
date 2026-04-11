@@ -1,3 +1,5 @@
+import type { ClaudeCapabilityPolicy } from "../core/claude-policy.js"
+
 // ---------------------------------------------------------------------------
 // SDK message types — mirror @anthropic-ai/claude-code streaming output
 // ---------------------------------------------------------------------------
@@ -16,8 +18,15 @@ export type ClaudeSDKMessage =
   | { type: "result"; subtype: "success" | "error"; result?: string; is_error?: boolean }
   | { type: "system"; subtype: string; session_id?: string }
 
+export type ClaudeSDKPolicy = ClaudeCapabilityPolicy
+
 export interface ClaudeClient {
-  run(params: { prompt: string; cwd?: string; sessionId?: string }): AsyncIterable<ClaudeSDKMessage>
+  run(params: {
+    prompt: string
+    cwd?: string
+    sessionId?: string
+    policy?: ClaudeSDKPolicy
+  }): AsyncIterable<ClaudeSDKMessage>
   abort(): void
 }
 
@@ -47,6 +56,7 @@ export function createClaudeClient(): ClaudeClient {
       prompt: string
       cwd?: string
       sessionId?: string
+      policy?: ClaudeSDKPolicy
     }): AsyncIterable<ClaudeSDKMessage> {
       const available = await tryLoadSdk()
       if (!available) {
@@ -63,6 +73,9 @@ export function createClaudeClient(): ClaudeClient {
             cwd?: string
             resume?: string
             maxTurns?: number
+            allowedTools?: string[]
+            disallowedTools?: string[]
+            permissionMode?: string
             [key: string]: unknown
           }
         }) => AsyncIterable<unknown>
@@ -78,6 +91,9 @@ export function createClaudeClient(): ClaudeClient {
           cwd: params.cwd,
           resume: params.sessionId,
           maxTurns: 10,
+          allowedTools: params.policy?.allowedTools,
+          disallowedTools: params.policy?.disallowedTools,
+          permissionMode: params.policy?.permissionMode,
         },
       })
 

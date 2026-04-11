@@ -28,6 +28,7 @@ export function createFakeRuntime(): Runtime {
           },
           launch: {
             command: params.command,
+            cwd: params.cwd,
           },
         },
       }

@@ -53,6 +53,7 @@ export function createTmuxRuntime(options: TmuxRuntimeOptions): Runtime {
   return {
     async start(params: RuntimeStartParams): Promise<RuntimeJob> {
       const id = `runtime-${nextId++}`
+      const jobCwd = params.cwd ?? cwd
       const sessionName = params.monitorSessionId
         ? `${sessionPrefix}-${params.monitorSessionId}`
         : `${sessionPrefix}-${params.backend}-${nextId - 1}`
@@ -66,7 +67,7 @@ export function createTmuxRuntime(options: TmuxRuntimeOptions): Runtime {
         attachCommand: `tmux attach -t ${sessionName}`,
         launch: {
           command: params.command,
-          cwd,
+          cwd: jobCwd,
         },
       }
       const job: RuntimeJob = {
@@ -82,12 +83,12 @@ export function createTmuxRuntime(options: TmuxRuntimeOptions): Runtime {
         ? await options.backend.joinSession({
             sessionName,
             command: params.command,
-            cwd,
+            cwd: jobCwd,
           })
         : await options.backend.createSession({
             sessionName,
             command: params.command,
-            cwd,
+            cwd: jobCwd,
           })
 
       if (sharedSession) {

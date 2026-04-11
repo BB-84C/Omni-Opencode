@@ -13,12 +13,16 @@ const ANSI = {
   blue: "\x1b[34m",
   white: "\x1b[37m",
   gray: "\x1b[90m",
+  brightWhite: "\x1b[97m",
+  brightCyan: "\x1b[96m",
 } as const
 
 function statusMarker(status: DashboardSnapshotJob["status"], frame: number): string {
   switch (status) {
     case "running":
       return `${ANSI.cyan}${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]}${ANSI.reset}`
+    case "waiting-approval":
+      return `${ANSI.yellow}!${ANSI.reset}`
     case "completed":
       return `${ANSI.green}✓${ANSI.reset}`
     case "failed":
@@ -33,6 +37,8 @@ function statusColor(status: DashboardSnapshotJob["status"]): string {
   switch (status) {
     case "running":
       return ANSI.white
+    case "waiting-approval":
+      return ANSI.yellow
     case "completed":
       return ANSI.green
     case "failed":
@@ -51,7 +57,8 @@ function renderJobLine(job: DashboardSnapshotJob, frame: number): string {
   const marker = statusMarker(job.status, frame)
   const color = statusColor(job.status)
   const label = job.label ? ` ${ANSI.gray}(${job.label})${ANSI.reset}` : ""
-  return `  ${marker} ${color}${job.id}${ANSI.reset} ${ANSI.dim}[${job.backend}]${ANSI.reset} -> ${ANSI.blue}window ${job.windowIndex}${ANSI.reset}${label}`
+  const windowLabel = `${ANSI.bold}${ANSI.brightWhite}[window ${job.windowIndex}]${ANSI.reset}`
+  return `  ${marker} ${color}${job.id}${ANSI.reset} ${ANSI.dim}[${job.backend}]${ANSI.reset} -> ${windowLabel}${label}`
 }
 
 export function renderDashboard(snapshot: DashboardSnapshot, frame: number): string {

@@ -76,6 +76,7 @@ type JobState = {
   childSessionId: string
   prompt: string
   cwd?: string
+  policy?: JobStartParams["policy"]
   status: "running" | "interrupted" | "completed" | "failed"
   changedFiles: string[]
   lastEventSeq: number
@@ -102,6 +103,7 @@ export function createClaudeAdapter(client: ClaudeClient): BackendAdapter {
         childSessionId: params.childSessionId,
         prompt: params.prompt,
         cwd: params.cwd,
+        policy: params.policy,
         status: "running",
         changedFiles: [],
         lastEventSeq: 0,
@@ -121,6 +123,7 @@ export function createClaudeAdapter(client: ClaudeClient): BackendAdapter {
         childSessionId: existing.childSessionId,
         prompt: instruction ?? existing.prompt,
         cwd: existing.cwd,
+        policy: existing.policy,
         status: "running",
         changedFiles: [],
         lastEventSeq: 0,
@@ -150,6 +153,7 @@ export function createClaudeAdapter(client: ClaudeClient): BackendAdapter {
         for await (const msg of client.run({
           prompt: state.prompt,
           cwd: state.cwd,
+          policy: state.policy,
         })) {
           if (state.status === "interrupted") {
             return

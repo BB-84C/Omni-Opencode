@@ -9,6 +9,12 @@ export function makeContext(sessionID: string, messageID = "message-1") {
     sessionID,
     messageID,
     agent: "test-agent",
+    permissions: {
+      edit: "allow",
+      bash: "allow",
+      webfetch: "deny",
+      task: "deny",
+    },
     directory: "D:/Omni-Opencode/.worktrees/pty-monitor",
     worktree: "D:/Omni-Opencode/.worktrees/pty-monitor",
     abort: new AbortController().signal,

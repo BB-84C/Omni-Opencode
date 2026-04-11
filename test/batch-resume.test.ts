@@ -194,19 +194,20 @@ describe("batch resume aggregation", () => {
     advanceToPhase(3)
     await vi.waitFor(() => {
       expect(client.message.create).toHaveBeenCalledTimes(1)
-    })
+    }, { timeout: 5000 })
 
     const aggregate = vi.mocked(client.message.create).mock.calls[0]?.[0]
     expect(aggregate).toMatchObject({
       sessionId: "parent-session-1",
       role: "user",
     })
-    expect(aggregate?.content).toContain("parent-session-1:message-1")
+    expect(aggregate?.content).toContain("2 delegated job(s) finished.")
     expect(aggregate?.content).toContain(claudeLaunch.jobId)
     expect(aggregate?.content).toContain(codexLaunch.jobId)
+    expect(aggregate?.content).toContain(`[claude-code] completed`)
+    expect(aggregate?.content).toContain(`[codex] completed`)
     expect(aggregate?.content).toContain("delegated_job_snapshot")
     expect(aggregate?.content).toContain("delegated_job_read")
     expect(aggregate?.content).toContain("delegated_job_attach")
-    expect(aggregate?.content).toContain("psmux attach -t parent-session-1")
   })
 })

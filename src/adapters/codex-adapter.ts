@@ -1,4 +1,5 @@
 import type { DelegatedEvent } from "../core/events.js"
+import { defaultCodexLaunchPolicy } from "../core/codex-policy.js"
 import type { BackendAdapter, JobHandle, JobStartParams, JobSnapshot } from "./types.js"
 import type { CodexClient, CodexNotification } from "./codex-client.js"
 
@@ -83,6 +84,7 @@ export function createCodexAdapter(client: CodexClient): BackendAdapter {
       const { threadId } = await client.startThread({
         prompt: params.prompt,
         cwd: params.cwd,
+        policy: params.codexPolicy ?? defaultCodexLaunchPolicy(),
       })
       const id = `codex-job-${++jobCounter}`
       const record: JobRecord = {

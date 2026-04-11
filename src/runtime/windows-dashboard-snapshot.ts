@@ -1,10 +1,11 @@
-export type DashboardSnapshotJobStatus = "running" | "completed" | "failed" | "cancelled" | "stopped"
+export type DashboardSnapshotJobStatus = "running" | "waiting-approval" | "completed" | "failed" | "cancelled" | "stopped"
 
 export type DashboardSnapshotJob = {
   id: string
   backend: "codex" | "claude-code"
   windowIndex: number
   status: DashboardSnapshotJobStatus
+  phase?: string
   label?: string
 }
 
@@ -32,6 +33,7 @@ export function buildDashboardSnapshot(input: BuildDashboardSnapshotInput): Dash
       backend: job.backend,
       windowIndex: job.windowIndex,
       status: job.status,
+      phase: job.phase,
       label: job.label,
     })),
     navigation: [

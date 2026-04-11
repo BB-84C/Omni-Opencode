@@ -13,3 +13,6 @@ CLAUDE.md
 .worktrees/
 opencode.json
 config.json
+/.omni-monitors
+/.omni-tools
+/.playwright-mcp

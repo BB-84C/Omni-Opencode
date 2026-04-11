@@ -125,14 +125,16 @@ describe("delegation flow e2e", () => {
       expect(messageCreate).toHaveBeenCalledWith({
         sessionId: "parent-session-1",
         role: "user",
-        content: expect.stringContaining("completed through the PTY runtime monitor"),
+        content: expect.stringContaining("1 delegated job(s) finished."),
       })
     })
 
     const followUp = vi.mocked(messageCreate).mock.calls[0]?.[0]?.content
+    expect(followUp).toContain("parent-session-1:claude-job-1")
+    expect(followUp).toContain("[claude-code] completed")
     expect(followUp).toContain("delegated_job_snapshot")
     expect(followUp).toContain("delegated_job_read")
-    expect(followUp).toContain("omni monitor claude-job-1")
+    expect(followUp).toContain("delegated_job_attach")
 
     const snapshot = await plugin.tool!.delegated_job_snapshot.execute(
       { jobId: "parent-session-1:claude-job-1" },

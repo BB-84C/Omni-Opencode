@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest"
 import { mapClaudeMessage, createClaudeAdapter } from "../src/adapters/claude-adapter.js"
-import type { ClaudeSDKMessage, ClaudeClient } from "../src/adapters/claude-client.js"
+import type { ClaudeSDKMessage, ClaudeClient, ClaudeSDKPolicy } from "../src/adapters/claude-client.js"
+import type { DelegationCapabilities } from "../src/core/delegation-permissions.js"
+import * as policyMappers from "../src/adapters/policy-mappers.js"
 
 // ---------------------------------------------------------------------------
 // Mock client helper
@@ -13,6 +15,22 @@ function createMockClaudeClient(messages: ClaudeSDKMessage[]): ClaudeClient {
     },
     abort() {},
   }
+}
+
+function mapClaudeCapabilities(capabilities: DelegationCapabilities) {
+  const mapper = (policyMappers as {
+    toClaudeCapabilityPolicy?: (value: DelegationCapabilities) => {
+      allowedTools: string[]
+      disallowedTools: string[]
+      permissionMode: string
+    }
+  }).toClaudeCapabilityPolicy
+
+  if (typeof mapper !== "function") {
+    throw new Error("Expected policy-mappers to export toClaudeCapabilityPolicy")
+  }
+
+  return mapper(capabilities)
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +169,78 @@ describe("mapClaudeMessage", () => {
   })
 })
 
+describe("toClaudeCapabilityPolicy", () => {
+  it("maps read-only capabilities to read tools with provider prompting disabled", () => {
+    expect(mapClaudeCapabilities({
+      workspaceWrite: "deny",
+      shell: "deny",
+      network: "allow",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo"],
+    })).toEqual({
+      allowedTools: ["Read", "Glob", "Grep", "WebFetch", "WebSearch"],
+      disallowedTools: [],
+      permissionMode: "bypassPermissions",
+    })
+  })
+
+  it("adds write tools when workspace writes are allowed", () => {
+    expect(mapClaudeCapabilities({
+      workspaceWrite: "allow",
+      shell: "deny",
+      network: "allow",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo"],
+    })).toEqual({
+      allowedTools: ["Read", "Glob", "Grep", "Edit", "Write", "WebFetch", "WebSearch"],
+      disallowedTools: [],
+      permissionMode: "bypassPermissions",
+    })
+  })
+
+  it("adds bash tools when shell access is allowed", () => {
+    expect(mapClaudeCapabilities({
+      workspaceWrite: "deny",
+      shell: "allow",
+      network: "allow",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo"],
+    })).toEqual({
+      allowedTools: ["Read", "Glob", "Grep", "Bash", "WebFetch", "WebSearch"],
+      disallowedTools: [],
+      permissionMode: "bypassPermissions",
+    })
+  })
+
+  it("disallows network tools when network access is denied", () => {
+    expect(mapClaudeCapabilities({
+      workspaceWrite: "allow",
+      shell: "allow",
+      network: "deny",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo"],
+    })).toEqual({
+      allowedTools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
+      disallowedTools: ["WebFetch", "WebSearch"],
+      permissionMode: "bypassPermissions",
+    })
+  })
+
+  it("adds network tools when network access is allowed", () => {
+    expect(mapClaudeCapabilities({
+      workspaceWrite: "allow",
+      shell: "allow",
+      network: "allow",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo"],
+    })).toEqual({
+      allowedTools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "WebFetch", "WebSearch"],
+      disallowedTools: [],
+      permissionMode: "bypassPermissions",
+    })
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Full adapter integration tests
 // ---------------------------------------------------------------------------
@@ -237,5 +327,43 @@ describe("createClaudeAdapter", () => {
     // Should contain a status.update from system message
     const hasStatusUpdate = events.some((e) => e.type === "status.update")
     expect(hasStatusUpdate).toBe(true)
+  })
+
+  it("passes mapped Claude policy through to client.run", async () => {
+    const received: Array<{ prompt: string; cwd?: string; policy?: ClaudeSDKPolicy }> = []
+    const client: ClaudeClient = {
+      async *run(params) {
+        received.push(params)
+        yield {
+          type: "result",
+          subtype: "success",
+          result: "completed",
+        }
+      },
+      abort() {},
+    }
+    const adapter = createClaudeAdapter(client)
+    const policy = mapClaudeCapabilities({
+      workspaceWrite: "allow",
+      shell: "allow",
+      network: "deny",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo"],
+    })
+    const handle = await adapter.startJob({
+      childSessionId,
+      prompt: "write a test",
+      policy,
+    })
+
+    for await (const _event of adapter.subscribeEvents(handle.id)) {
+      // consume stream
+    }
+
+    expect(received).toEqual([{
+      prompt: "write a test",
+      cwd: undefined,
+      policy,
+    }])
   })
 })

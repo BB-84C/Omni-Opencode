@@ -476,9 +476,11 @@ describe("Dashboard snapshot file writes", () => {
     const snapshotPath = buildWindowsPsmuxDashboardSnapshotPath(join(cwd, ".omni-monitors"), "parent-session-1")
     const snapshot = await readSnapshotFile(snapshotPath)
 
-    expect(snapshot.jobs).toHaveLength(1)
+    expect(snapshot.jobs).toHaveLength(2)
     expect(snapshot.jobs[0]?.id).toBe("runtime-1")
     expect(snapshot.jobs[0]?.status).toBe("running")
+    expect(snapshot.jobs[1]?.id).toBe("runtime-2")
+    expect(snapshot.jobs[1]?.status).toBe("cancelled")
   })
 
   it("isolates snapshot files per parent session", async () => {

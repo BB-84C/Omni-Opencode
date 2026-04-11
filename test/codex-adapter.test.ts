@@ -2,6 +2,18 @@ import { describe, expect, it } from "vitest"
 import { mapCodexEvent, createCodexAdapter } from "../src/adapters/codex-adapter.js"
 import type { CodexNotification, CodexClient } from "../src/adapters/codex-client.js"
 import type { JobStartParams } from "../src/adapters/types.js"
+import type { DelegationCapabilities } from "../src/core/delegation-permissions.js"
+import { defaultCodexLaunchPolicy } from "../src/core/codex-policy.js"
+import { toCodexCapabilityPolicy } from "../src/adapters/policy-mappers.js"
+
+type CodexCapabilityPolicy = {
+  sandboxMode: "read-only" | "workspace-write"
+  writableRoots: string[]
+  networkAccess: boolean
+  approvalPolicy: string
+}
+
+const mapCodexCapabilities: (capabilities: DelegationCapabilities) => CodexCapabilityPolicy = toCodexCapabilityPolicy
 
 function createMockCodexClient(notifications: CodexNotification[]): CodexClient {
   return {
@@ -115,6 +127,37 @@ describe("createCodexAdapter", () => {
     expect(typeof handle.id).toBe("string")
   })
 
+  it("startJob supplies the adapter-owned default Codex policy when none is provided", async () => {
+    let captured: { prompt: string; cwd?: string; policy?: unknown } | undefined
+    const client: CodexClient = {
+      async startThread(params) {
+        captured = params
+        return { threadId: "t1" }
+      },
+      async cancelThread() {},
+      async *subscribeNotifications() {},
+      close() {},
+    }
+
+    const adapter = createCodexAdapter(client)
+    await adapter.startJob({
+      childSessionId: "child-1",
+      prompt: "Do something",
+      cwd: "/tmp",
+    })
+
+     expect(captured).toEqual({
+       prompt: "Do something",
+       cwd: "/tmp",
+       policy: {
+          sandboxMode: "read-only",
+          writableRoots: [],
+          networkAccess: false,
+          approvalPolicy: "never",
+        },
+      })
+   })
+
   it("subscribeEvents yields mapped canonical events from mock client notifications", async () => {
     const notifications: CodexNotification[] = [
       { method: "turn/started", params: { threadId: "t1", turnId: "turn-1" } },
@@ -139,5 +182,108 @@ describe("createCodexAdapter", () => {
     expect((events[0] as { type: string }).type).toBe("status.update")
     expect((events[1] as { type: string }).type).toBe("assistant.delta")
     expect((events[2] as { type: string }).type).toBe("result.final")
+  })
+})
+
+describe("defaultCodexLaunchPolicy", () => {
+  it("defaults to a conservative read-only sandbox", () => {
+    expect(defaultCodexLaunchPolicy()).toEqual({
+      sandboxMode: "read-only",
+      writableRoots: [],
+      networkAccess: false,
+      approvalPolicy: "never",
+    })
+  })
+})
+
+describe("toCodexCapabilityPolicy", () => {
+  it("maps denied workspace writes to a read-only sandbox", () => {
+    expect(mapCodexCapabilities({
+      workspaceWrite: "deny",
+      shell: "deny",
+      network: "allow",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo"],
+    })).toEqual({
+      sandboxMode: "read-only",
+      writableRoots: ["/repo"],
+      networkAccess: true,
+      approvalPolicy: "never",
+    })
+  })
+
+  it("maps allowed workspace writes to a workspace-write sandbox", () => {
+    expect(mapCodexCapabilities({
+      workspaceWrite: "allow",
+      shell: "allow",
+      network: "allow",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo"],
+    })).toEqual({
+      sandboxMode: "workspace-write",
+      writableRoots: ["/repo"],
+      networkAccess: true,
+      approvalPolicy: "never",
+    })
+  })
+
+  it("disables network access when capabilities deny it inside workspace-write", () => {
+    expect(mapCodexCapabilities({
+      workspaceWrite: "allow",
+      shell: "allow",
+      network: "deny",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo"],
+    })).toEqual({
+      sandboxMode: "workspace-write",
+      writableRoots: ["/repo"],
+      networkAccess: false,
+      approvalPolicy: "never",
+    })
+  })
+
+  it("forwards allowed roots as writable roots", () => {
+    expect(mapCodexCapabilities({
+      workspaceWrite: "allow",
+      shell: "allow",
+      network: "allow",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo", "/repo/vendor"],
+    })).toEqual({
+      sandboxMode: "workspace-write",
+      writableRoots: ["/repo", "/repo/vendor"],
+      networkAccess: true,
+      approvalPolicy: "never",
+    })
+  })
+
+  it("falls back to a read-only sandbox when shell access is denied", () => {
+    expect(mapCodexCapabilities({
+      workspaceWrite: "allow",
+      shell: "deny",
+      network: "allow",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo"],
+    })).toEqual({
+      sandboxMode: "read-only",
+      writableRoots: ["/repo"],
+      networkAccess: true,
+      approvalPolicy: "never",
+    })
+  })
+
+  it("falls back to a read-only sandbox when shell access is still unresolved", () => {
+    expect(mapCodexCapabilities({
+      workspaceWrite: "allow",
+      shell: "ask",
+      network: "allow",
+      subagentLaunch: "deny",
+      allowedRoots: ["/repo"],
+    })).toEqual({
+      sandboxMode: "read-only",
+      writableRoots: ["/repo"],
+      networkAccess: true,
+      approvalPolicy: "never",
+    })
   })
 })

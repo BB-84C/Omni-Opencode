@@ -19,6 +19,196 @@ async function loadPlugin(runtimeKind: "windows-pty" | "tmux" = "windows-pty") {
   })
 }
 
+async function loadPluginAtDirectory(directory: string, runtimeKind: "windows-psmux" | "windows-pty" | "tmux" = "windows-pty") {
+  vi.resetModules()
+
+  let launchCount = 0
+  const runtime = {
+    start: vi.fn(async ({ backend, command, monitorSessionId }: { backend: "claude-code" | "codex"; command: string; monitorSessionId?: string }) => {
+      launchCount += 1
+      const jobId = backend === "claude-code" ? `claude-job-${launchCount}` : `codex-job-${launchCount}`
+      return {
+        id: jobId,
+        backend,
+        command,
+        status: "running" as const,
+        monitor: {
+          id: `${jobId}-monitor`,
+          sessionId: runtimeKind === "windows-psmux" ? (monitorSessionId ?? jobId) : undefined,
+          attach: runtimeKind === "windows-psmux"
+            ? { mode: "pty" as const, target: `${monitorSessionId ?? jobId}:dashboard` }
+            : { mode: "pty" as const, target: `${jobId}-pty` },
+          attachCommand: runtimeKind === "windows-psmux" ? `psmux attach -t ${monitorSessionId ?? jobId}` : undefined,
+          launch: {
+            command: runtimeKind === "windows-psmux" ? `psmux attach -t ${monitorSessionId ?? jobId}` : command,
+            cwd: "D:/Omni-Opencode/.worktrees/pty-monitor",
+          },
+        },
+      }
+    }),
+    read: vi.fn(async () => ({ data: "" })),
+    stop: vi.fn(async () => undefined),
+    snapshot: vi.fn(async () => ({ jobs: [] })),
+    openMonitor: vi.fn(async (lookup: { type: "job"; jobId: string } | { type: "shared-session"; monitorSessionId: string }) => ({
+      id: `${lookup.type === "shared-session" ? lookup.monitorSessionId : lookup.jobId}-monitor`,
+      sessionId: lookup.type === "shared-session" ? lookup.monitorSessionId : undefined,
+      attach: lookup.type === "shared-session"
+        ? { mode: "pty" as const, target: `${lookup.monitorSessionId}:dashboard` }
+        : { mode: "pty" as const, target: `${lookup.jobId}-pty` },
+      attachCommand: lookup.type === "shared-session" ? `psmux attach -t ${lookup.monitorSessionId}` : undefined,
+      launch: {
+        command: lookup.type === "shared-session" ? `psmux attach -t ${lookup.monitorSessionId}` : `attached ${lookup.jobId}`,
+        cwd: "D:/Omni-Opencode/.worktrees/pty-monitor",
+      },
+    })),
+  }
+
+  vi.doMock("../src/runtime/select-runtime.js", () => ({
+    selectRuntime: () => ({
+      kind: runtimeKind,
+      runtime,
+      autoOpenMonitor: true,
+      start: async (params: { backend: "claude-code" | "codex"; command: string; monitorSessionId?: string }) => {
+        const job = await runtime.start(params)
+        const monitor = runtimeKind === "windows-psmux" && params.monitorSessionId
+          ? await runtime.openMonitor({ type: "shared-session", monitorSessionId: params.monitorSessionId })
+          : await runtime.openMonitor({ type: "job", jobId: job.id })
+        return { job, monitor }
+      },
+    }),
+  }))
+
+  const { OmniOpencodePlugin } = await import("../src/plugin.js")
+  const client = {
+    session: {
+      create: vi.fn(),
+      promptAsync: vi.fn().mockResolvedValue(undefined),
+    },
+    message: {
+      create: vi.fn().mockResolvedValue(undefined),
+    },
+  }
+  const plugin = await OmniOpencodePlugin({
+    client: client as never,
+    directory,
+  } as never)
+
+  return { plugin, client, runtime }
+}
+
+type MockDelegationEnvelope = {
+  capabilities: {
+    workspaceWrite: "allow" | "ask" | "deny"
+    shell: "allow" | "ask" | "deny"
+    network: "allow" | "ask" | "deny"
+    subagentLaunch: "allow" | "ask" | "deny"
+    allowedRoots: string[]
+  }
+  fingerprint: string
+}
+
+async function loadPluginWithMockedDelegationEnvelope(
+  directory: string,
+  envelope: MockDelegationEnvelope,
+  runtimeKind: "windows-psmux" | "windows-pty" | "tmux" = "windows-pty",
+) {
+  vi.resetModules()
+
+  const state = {
+    envelope,
+  }
+
+  let launchCount = 0
+  const runtime = {
+    start: vi.fn(async ({ backend, command, monitorSessionId }: { backend: "claude-code" | "codex"; command: string; monitorSessionId?: string }) => {
+      launchCount += 1
+      const jobId = backend === "claude-code" ? `claude-job-${launchCount}` : `codex-job-${launchCount}`
+      return {
+        id: jobId,
+        backend,
+        command,
+        status: "running" as const,
+        monitor: {
+          id: `${jobId}-monitor`,
+          sessionId: runtimeKind === "windows-psmux" ? (monitorSessionId ?? jobId) : undefined,
+          attach: runtimeKind === "windows-psmux"
+            ? { mode: "pty" as const, target: `${monitorSessionId ?? jobId}:dashboard` }
+            : { mode: "pty" as const, target: `${jobId}-pty` },
+          attachCommand: runtimeKind === "windows-psmux" ? `psmux attach -t ${monitorSessionId ?? jobId}` : undefined,
+          launch: {
+            command: runtimeKind === "windows-psmux" ? `psmux attach -t ${monitorSessionId ?? jobId}` : command,
+            cwd: "D:/Omni-Opencode/.worktrees/pty-monitor",
+          },
+        },
+      }
+    }),
+    read: vi.fn(async () => ({ data: "" })),
+    stop: vi.fn(async () => undefined),
+    snapshot: vi.fn(async () => ({ jobs: [] })),
+    openMonitor: vi.fn(async (lookup: { type: "job"; jobId: string } | { type: "shared-session"; monitorSessionId: string }) => ({
+      id: `${lookup.type === "shared-session" ? lookup.monitorSessionId : lookup.jobId}-monitor`,
+      sessionId: lookup.type === "shared-session" ? lookup.monitorSessionId : undefined,
+      attach: lookup.type === "shared-session"
+        ? { mode: "pty" as const, target: `${lookup.monitorSessionId}:dashboard` }
+        : { mode: "pty" as const, target: `${lookup.jobId}-pty` },
+      attachCommand: lookup.type === "shared-session" ? `psmux attach -t ${lookup.monitorSessionId}` : undefined,
+      launch: {
+        command: lookup.type === "shared-session" ? `psmux attach -t ${lookup.monitorSessionId}` : `attached ${lookup.jobId}`,
+        cwd: "D:/Omni-Opencode/.worktrees/pty-monitor",
+      },
+    })),
+  }
+
+  vi.doMock("../src/runtime/select-runtime.js", () => ({
+    selectRuntime: () => ({
+      kind: runtimeKind,
+      runtime,
+      autoOpenMonitor: true,
+      start: async (params: { backend: "claude-code" | "codex"; command: string; monitorSessionId?: string }) => {
+        const job = await runtime.start(params)
+        const monitor = runtimeKind === "windows-psmux" && params.monitorSessionId
+          ? await runtime.openMonitor({ type: "shared-session", monitorSessionId: params.monitorSessionId })
+          : await runtime.openMonitor({ type: "job", jobId: job.id })
+        return { job, monitor }
+      },
+    }),
+  }))
+
+  vi.doMock("../src/core/delegation-permissions.js", async () => {
+    const actual = await vi.importActual<typeof import("../src/core/delegation-permissions.js")>("../src/core/delegation-permissions.js")
+    return {
+      ...actual,
+      deriveDelegationCapabilities: vi.fn(() => state.envelope.capabilities),
+      fingerprintDelegationPermissions: vi.fn(() => state.envelope.fingerprint),
+      fingerprintDelegationCapabilities: vi.fn(() => state.envelope.fingerprint),
+    }
+  })
+
+  const { OmniOpencodePlugin } = await import("../src/plugin.js")
+  const client = {
+    session: {
+      create: vi.fn(),
+      promptAsync: vi.fn().mockResolvedValue(undefined),
+    },
+    message: {
+      create: vi.fn().mockResolvedValue(undefined),
+    },
+  }
+  const plugin = await OmniOpencodePlugin({
+    client: client as never,
+    directory,
+  } as never)
+
+  return {
+    plugin,
+    client,
+    runtime,
+    setDelegationEnvelope(nextEnvelope: MockDelegationEnvelope) {
+      state.envelope = nextEnvelope
+    },
+  }
+}
+
 async function loadPluginWithoutMessageCreate() {
   return loadDelegationPlugin({
     runtimeKind: "windows-pty",
@@ -191,6 +381,23 @@ describe("parent-facing delegation tools", () => {
   it("keys launched jobs on the parent session id and returns monitor metadata immediately", async () => {
     const { plugin, runtime } = await loadPlugin("tmux")
 
+    vi.mocked(runtime.start).mockImplementationOnce(async ({ backend, command }: { backend: "claude-code" | "codex"; command: string }) => ({
+      id: "claude-job-1",
+      backend,
+      command,
+      status: "running" as const,
+      backendSessionId: "claude-session-42",
+      backendResumeSessionId: "claude-resume-42",
+      monitor: {
+        id: "claude-job-1-monitor",
+        attach: { mode: "pty" as const, target: "claude-job-1-pty" },
+        launch: {
+          command: "attached claude-job-1",
+          cwd: "D:/Omni-Opencode/.worktrees/pty-monitor",
+        },
+      },
+    }))
+
     const output = await plugin.tool!.delegate_to_claude.execute(
       { prompt: "inspect the vault door" },
       makeContext("parent-session-1") as never,
@@ -215,6 +422,17 @@ describe("parent-facing delegation tools", () => {
     expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
       backend: "claude-code",
       command: expect.stringContaining("inspect the vault door"),
+      commandArgs: ["claude", "--print", "inspect the vault door"],
+      launchMetadata: expect.objectContaining({
+        claudePolicy: {
+          allowedTools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
+          disallowedTools: ["WebFetch", "WebSearch"],
+          permissionMode: "bypassPermissions",
+        },
+        prompt: "inspect the vault door",
+        promptFingerprint: expect.any(String),
+        correlationMarker: "omni-opencode:parent-session-1:message-1:claude-code",
+      }),
       monitorSessionId: "parent-session-1",
     }))
     expect(result).toEqual({
@@ -246,6 +464,10 @@ describe("parent-facing delegation tools", () => {
     expect(snapshot).toContain('"jobId": "parent-session-1:claude-job-1"')
     expect(snapshot).toContain('"parentSessionId": "parent-session-1"')
     expect(snapshot).toContain('"runtimeType": "tmux"')
+    expect(snapshot).toContain('"backendSessionId": "claude-session-42"')
+    expect(snapshot).toContain('"backendResumeSessionId": "claude-resume-42"')
+    expect(snapshot).toContain('"correlationMarker": "omni-opencode:parent-session-1:message-1:claude-code"')
+    expect(snapshot).toContain('"promptFingerprint": "')
     expect(snapshot).not.toContain('"childSessionId"')
   })
 
@@ -268,11 +490,23 @@ describe("parent-facing delegation tools", () => {
       }
     }
 
-    expect(runtime.start).toHaveBeenCalledWith({
+    expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
       backend: "claude-code",
       command: expect.stringContaining("inspect the vault door"),
+      cwd: "D:/Omni-Opencode/.worktrees/pty-monitor",
+      commandArgs: ["claude", "--print", "inspect the vault door"],
+      launchMetadata: expect.objectContaining({
+        claudePolicy: {
+          allowedTools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
+          disallowedTools: ["WebFetch", "WebSearch"],
+          permissionMode: "bypassPermissions",
+        },
+        prompt: "inspect the vault door",
+        promptFingerprint: expect.any(String),
+        correlationMarker: "omni-opencode:parent-session-1:message-1:claude-code",
+      }),
       monitorSessionId: "parent-session-1",
-    })
+    }))
     expect(runtime.openMonitor).toHaveBeenCalledTimes(1)
     expect(result.jobId).toBe("parent-session-1:claude-job-1")
     expect(result.batchId).toBe("parent-session-1:message-1")
@@ -515,17 +749,363 @@ describe("parent-facing delegation tools", () => {
     }))
   })
 
+  it("assigns the safe permission profile to review-style delegations without prompting the user", async () => {
+    const { plugin } = await loadPlugin()
+    const context = makeContext("parent-session-safe")
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "review README.md and summarize the current delegation flow" },
+      context as never,
+    )
+
+    expect(context.ask).not.toHaveBeenCalled()
+
+    const snapshot = await plugin.tool!.delegated_job_snapshot.execute(
+      { jobId: "parent-session-safe:codex-job-1" },
+      context as never,
+    )
+
+    expect(snapshot).toContain('"taskClass": "review"')
+    expect(snapshot).toContain('"permissionProfile": "safe"')
+    expect(snapshot).toContain('"approvalMode": "not-required"')
+  })
+
+  it("keeps review and investigation prompts safe even when they mention risky commands as subject matter", async () => {
+    const { plugin, runtime } = await loadPlugin()
+
+    const reviewContext = makeContext("parent-session-review-subject", "message-1")
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "review why `npm test` fails and explain the likely cause without changing any files" },
+      reviewContext as never,
+    )
+
+    const summaryContext = makeContext("parent-session-review-subject", "message-2")
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "summarize the recent update to src/plugin.ts and analyze whether it looks correct; do not modify anything" },
+      summaryContext as never,
+    )
+
+    expect(reviewContext.ask).not.toHaveBeenCalled()
+    expect(summaryContext.ask).not.toHaveBeenCalled()
+    expect(runtime.start).toHaveBeenCalledTimes(2)
+
+    const firstSnapshot = await plugin.tool!.delegated_job_snapshot.execute(
+      { jobId: "parent-session-review-subject:codex-job-1" },
+      reviewContext as never,
+    )
+    const secondSnapshot = await plugin.tool!.delegated_job_snapshot.execute(
+      { jobId: "parent-session-review-subject:claude-job-1" },
+      summaryContext as never,
+    )
+
+    expect(firstSnapshot).toContain('"permissionProfile": "safe"')
+    expect(firstSnapshot).toContain('"approvalMode": "not-required"')
+    expect(secondSnapshot).toContain('"permissionProfile": "safe"')
+    expect(secondSnapshot).toContain('"approvalMode": "not-required"')
+  })
+
+  it("prompts once per delegated launch with the unresolved capability names in the prompt body", async () => {
+    const directory = uniqueStateDir("delegation-grouped-prompt")
+    const { plugin, runtime } = await loadPluginWithMockedDelegationEnvelope(directory, {
+      capabilities: {
+        workspaceWrite: "ask",
+        shell: "ask",
+        network: "deny",
+        subagentLaunch: "deny",
+        allowedRoots: ["D:/Omni-Opencode/.worktrees/pty-monitor"],
+      },
+      fingerprint: "fingerprint-file-and-shell",
+    })
+    const context = makeContext("parent-session-approval", "message-1")
+    vi.mocked(context.ask).mockResolvedValue("allow-once")
+
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "edit src/plugin.ts and run npm test" },
+      context as never,
+    )
+
+    expect(context.ask).toHaveBeenCalledTimes(1)
+    expect(context.ask).toHaveBeenCalledWith(expect.objectContaining({
+      description: expect.stringContaining("file edits"),
+      options: ["allow-once", "allow-session", "deny"],
+    }))
+    expect(context.ask).toHaveBeenCalledWith(expect.objectContaining({
+      description: expect.stringContaining("shell commands"),
+    }))
+    expect(runtime.start).toHaveBeenCalledTimes(1)
+    expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
+      backend: "claude-code",
+      launchMetadata: expect.objectContaining({
+        claudePolicy: {
+          allowedTools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
+          disallowedTools: ["WebFetch", "WebSearch"],
+          permissionMode: "bypassPermissions",
+        },
+      }),
+    }))
+  })
+
+  it("still prompts for unresolved delegated capabilities when task classification is safe", async () => {
+    const directory = uniqueStateDir("delegation-safe-envelope-ask")
+    const { plugin, runtime } = await loadPluginWithMockedDelegationEnvelope(directory, {
+      capabilities: {
+        workspaceWrite: "ask",
+        shell: "deny",
+        network: "deny",
+        subagentLaunch: "deny",
+        allowedRoots: ["D:/Omni-Opencode/.worktrees/pty-monitor"],
+      },
+      fingerprint: "fingerprint-safe-ask",
+    })
+    const context = makeContext("parent-session-safe-envelope", "message-1")
+    vi.mocked(context.ask).mockResolvedValue("allow-once")
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "review src/plugin.ts and summarize likely edits" },
+      context as never,
+    )
+
+    expect(context.ask).toHaveBeenCalledTimes(1)
+    expect(runtime.start).toHaveBeenCalledTimes(1)
+
+    const snapshot = await plugin.tool!.delegated_job_snapshot.execute(
+      { jobId: "parent-session-safe-envelope:codex-job-1" },
+      context as never,
+    )
+
+    expect(snapshot).toContain('"permissionProfile": "safe"')
+    expect(snapshot).toContain('"approvalMode": "once"')
+  })
+
+  it("reuses allow-session grants only for the same agent and permission fingerprint across relaunches", async () => {
+    const directory = uniqueStateDir("delegation-grouped-end-to-end-grant-reuse")
+    const { plugin, runtime, setDelegationEnvelope } = await loadPluginWithMockedDelegationEnvelope(directory, {
+      capabilities: {
+        workspaceWrite: "ask",
+        shell: "deny",
+        network: "deny",
+        subagentLaunch: "deny",
+        allowedRoots: ["D:/Omni-Opencode/.worktrees/pty-monitor"],
+      },
+      fingerprint: "fingerprint-agent-a",
+    })
+
+    const firstContext = makeContext("parent-session-approval", "message-1")
+    firstContext.agent = "codex:gpt-5.4"
+    vi.mocked(firstContext.ask).mockResolvedValue("allow-session")
+
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "edit src/plugin.ts" },
+      firstContext as never,
+    )
+
+    const crossBackendContext = makeContext("parent-session-approval", "message-2")
+    crossBackendContext.agent = "codex:gpt-5.4"
+    vi.mocked(crossBackendContext.ask).mockResolvedValue("allow-once")
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "edit src/core/jobs.ts" },
+      crossBackendContext as never,
+    )
+
+    const sameBackendContext = makeContext("parent-session-approval", "message-3")
+    sameBackendContext.agent = "codex:gpt-5.4"
+
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "edit src/core/store.ts" },
+      sameBackendContext as never,
+    )
+
+    const differentAgentContext = makeContext("parent-session-approval", "message-4")
+    differentAgentContext.agent = "claude:sonnet"
+    vi.mocked(differentAgentContext.ask).mockResolvedValue("allow-once")
+
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "edit src/core/events.ts" },
+      differentAgentContext as never,
+    )
+
+    setDelegationEnvelope({
+      capabilities: {
+        workspaceWrite: "ask",
+        shell: "ask",
+        network: "deny",
+        subagentLaunch: "deny",
+        allowedRoots: ["D:/Omni-Opencode/.worktrees/pty-monitor"],
+      },
+      fingerprint: "fingerprint-agent-a-shell",
+    })
+
+    const changedFingerprintContext = makeContext("parent-session-approval", "message-5")
+    changedFingerprintContext.agent = "codex:gpt-5.4"
+    vi.mocked(changedFingerprintContext.ask).mockResolvedValue("allow-once")
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "edit src/core/store.ts and run npm test" },
+      changedFingerprintContext as never,
+    )
+
+    expect(firstContext.ask).toHaveBeenCalledTimes(1)
+    expect(crossBackendContext.ask).toHaveBeenCalledTimes(1)
+    expect(sameBackendContext.ask).not.toHaveBeenCalled()
+    expect(differentAgentContext.ask).toHaveBeenCalledTimes(1)
+    expect(changedFingerprintContext.ask).toHaveBeenCalledTimes(1)
+    expect(runtime.start).toHaveBeenCalledTimes(5)
+  })
+
+  it("passes the active worktree through as the delegated launch cwd", async () => {
+    const directory = uniqueStateDir("delegation-runtime-cwd")
+    const { plugin, runtime } = await loadPluginWithMockedDelegationEnvelope(directory, {
+      capabilities: {
+        workspaceWrite: "allow",
+        shell: "allow",
+        network: "deny",
+        subagentLaunch: "deny",
+        allowedRoots: ["D:/Omni-Opencode/.worktrees/feature-fix"],
+      },
+      fingerprint: "fingerprint-runtime-cwd",
+    })
+
+    const context = {
+      ...makeContext("parent-session-cwd", "message-1"),
+      directory: "D:/Omni-Opencode",
+      worktree: "D:/Omni-Opencode/.worktrees/feature-fix",
+    }
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "inspect src/plugin.ts" },
+      context as never,
+    )
+
+    expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
+      backend: "codex",
+      cwd: "D:/Omni-Opencode/.worktrees/feature-fix",
+    }))
+  })
+
+  it("does not pass a synthetic missing workspace fallback as the delegated launch cwd", async () => {
+    const directory = uniqueStateDir("delegation-runtime-missing-cwd")
+    const { plugin, runtime } = await loadPluginWithMockedDelegationEnvelope(directory, {
+      capabilities: {
+        workspaceWrite: "deny",
+        shell: "deny",
+        network: "deny",
+        subagentLaunch: "deny",
+        allowedRoots: [],
+      },
+      fingerprint: "fingerprint-runtime-missing-cwd",
+    })
+
+    const context = {
+      sessionID: "parent-session-missing-cwd",
+      messageID: "message-1",
+      agent: "codex:gpt-5.4",
+      permissions: {},
+      abort: new AbortController().signal,
+      metadata: vi.fn(),
+      ask: vi.fn(),
+    }
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "inspect src/plugin.ts" },
+      context as never,
+    )
+
+    expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
+      backend: "codex",
+      cwd: undefined,
+    }))
+  })
+
+  it("does not let a stored allow-session grant re-escalate a capability after it downgrades to deny", async () => {
+    const directory = uniqueStateDir("delegation-grouped-grant-downgrade")
+    const { plugin, runtime, setDelegationEnvelope } = await loadPluginWithMockedDelegationEnvelope(directory, {
+      capabilities: {
+        workspaceWrite: "ask",
+        shell: "deny",
+        network: "deny",
+        subagentLaunch: "deny",
+        allowedRoots: ["D:/Omni-Opencode/.worktrees/pty-monitor"],
+      },
+      fingerprint: "fingerprint-downgrade",
+    })
+
+    const firstContext = makeContext("parent-session-deny-downgrade", "message-1")
+    firstContext.agent = "codex:gpt-5.4"
+    vi.mocked(firstContext.ask).mockResolvedValue("allow-session")
+
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "edit src/plugin.ts" },
+      firstContext as never,
+    )
+
+    setDelegationEnvelope({
+      capabilities: {
+        workspaceWrite: "deny",
+        shell: "deny",
+        network: "deny",
+        subagentLaunch: "deny",
+        allowedRoots: ["D:/Omni-Opencode/.worktrees/pty-monitor"],
+      },
+      fingerprint: "fingerprint-downgrade",
+    })
+
+    const secondContext = makeContext("parent-session-deny-downgrade", "message-2")
+    secondContext.agent = "codex:gpt-5.4"
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "edit src/core/jobs.ts" },
+      secondContext as never,
+    )
+
+    expect(secondContext.ask).not.toHaveBeenCalled()
+    expect(runtime.start).toHaveBeenCalledTimes(2)
+    expect(runtime.start).toHaveBeenLastCalledWith(expect.objectContaining({
+      launchMetadata: expect.objectContaining({
+        codexPolicy: expect.objectContaining({
+          sandboxMode: "read-only",
+        }),
+      }),
+    }))
+  })
+
+  it("aborts launch when grouped capability approval is denied", async () => {
+    const directory = uniqueStateDir("delegation-grouped-deny")
+    const { plugin, runtime } = await loadPluginWithMockedDelegationEnvelope(directory, {
+      capabilities: {
+        workspaceWrite: "ask",
+        shell: "ask",
+        network: "deny",
+        subagentLaunch: "deny",
+        allowedRoots: ["D:/Omni-Opencode/.worktrees/pty-monitor"],
+      },
+      fingerprint: "fingerprint-deny",
+    })
+    const context = makeContext("parent-session-deny", "message-1")
+    vi.mocked(context.ask).mockResolvedValue("deny")
+
+    await expect(plugin.tool!.delegate_to_claude.execute(
+      { prompt: "edit src/plugin.ts and run npm test" },
+      context as never,
+    )).rejects.toThrow(/not approved/i)
+
+    expect(context.ask).toHaveBeenCalledTimes(1)
+    expect(runtime.start).not.toHaveBeenCalled()
+  })
+
   it("uses delegated job id terminology for cancel lookups and responses", async () => {
     const { plugin, runtime } = await loadPlugin()
+    const context = makeContext("parent-session-9")
+    vi.mocked(context.ask).mockResolvedValue("allow-once")
 
     await plugin.tool!.delegate_to_codex.execute(
       { prompt: "repair the reactor" },
-      makeContext("parent-session-9") as never,
+      context as never,
     )
 
     const cancelResult = await plugin.tool!.delegated_job_cancel.execute(
       { jobId: "parent-session-9:codex-job-1" },
-      makeContext("parent-session-9") as never,
+      context as never,
     )
 
     expect(runtime.stop).toHaveBeenCalledWith("codex-job-1")

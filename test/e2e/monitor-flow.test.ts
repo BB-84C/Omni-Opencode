@@ -199,19 +199,21 @@ describe("monitor flow e2e", () => {
 
     await vi.waitFor(() => {
       expect(client.message.create).toHaveBeenCalledTimes(1)
-    })
+    }, { timeout: 5000 })
 
     const aggregateFollowUp = vi.mocked(client.message.create).mock.calls[0]?.[0]
     expect(aggregateFollowUp).toMatchObject({
       sessionId: "parent-session-1",
       role: "user",
     })
-    expect(aggregateFollowUp?.content).toContain("parent-session-1:message-1")
+    expect(aggregateFollowUp?.content).toContain("2 delegated job(s) finished.")
     expect(aggregateFollowUp?.content).toContain(claudeLaunch.jobId)
     expect(aggregateFollowUp?.content).toContain(codexLaunch.jobId)
+    expect(aggregateFollowUp?.content).toContain(`[claude-code] completed`)
+    expect(aggregateFollowUp?.content).toContain(`[codex] completed`)
     expect(aggregateFollowUp?.content).toContain("delegated_job_snapshot")
     expect(aggregateFollowUp?.content).toContain("delegated_job_read")
-    expect(aggregateFollowUp?.content).toContain("psmux attach -t parent-session-1")
+    expect(aggregateFollowUp?.content).toContain("delegated_job_attach")
 
     await vi.waitFor(async () => {
       const claudeFinal = parseSnapshot(await plugin.tool!.delegated_job_snapshot.execute(

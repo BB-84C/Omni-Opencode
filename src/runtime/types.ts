@@ -1,3 +1,6 @@
+import type { ClaudeCapabilityPolicy } from "../core/claude-policy.js"
+import type { CodexCapabilityPolicy } from "../core/codex-policy.js"
+
 export type RuntimeBackend = "claude-code" | "codex"
 
 export type RuntimeKind = "windows-psmux" | "windows-pty" | "tmux"
@@ -11,12 +14,24 @@ export type PrimaryRuntimeKind = Exclude<RuntimeKind, ArchivedRuntimeKind>
 export type RuntimeStartParams = {
   backend: RuntimeBackend
   command: string
+  cwd?: string
+  commandArgs?: string[]
+  launchMetadata?: RuntimeStartLaunchMetadata
   monitorSessionId?: string
+}
+
+export type RuntimeStartLaunchMetadata = {
+  prompt: string
+  promptFingerprint: string
+  correlationMarker: string
+  claudePolicy?: ClaudeCapabilityPolicy
+  codexPolicy?: CodexCapabilityPolicy
 }
 
 export type RuntimeLaunchMetadata = {
   command: string
   cwd?: string
+  outputMode?: "native" | "stream-json-renderer"
 }
 
 export type RuntimeAttachMetadata = {
@@ -40,6 +55,7 @@ export type RuntimeMonitor = {
   attachCommand?: string
   logTailCommand?: string
   transcriptCaptureTarget?: string
+  structuredStreamCaptureTarget?: string
 }
 
 export type RuntimeJob = {
@@ -48,6 +64,8 @@ export type RuntimeJob = {
   command: string
   status: "running" | "stopped"
   monitor: RuntimeMonitor
+  backendSessionId?: string
+  backendResumeSessionId?: string
 }
 
 export type RuntimeReadResult = {

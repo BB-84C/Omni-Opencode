@@ -1,5 +1,11 @@
-import { describe, expect, it, vi } from "vitest"
+import { readFileSync, rmSync } from "node:fs"
+import { appendFile, mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+import { renderDashboard } from "../src/runtime/windows-dashboard-renderer.js"
 import {
+  buildWindowsPsmuxDashboardSnapshotPath,
   createWindowsPsmuxDashboardLayout,
   createWindowsPsmuxRuntime,
   discoverWindowsPsmuxDashboardLayout,
@@ -14,6 +20,11 @@ function createManagedInstallResult(binaryPath = "psmux") {
     installed: false,
   }
 }
+
+const claudeHeavyStdoutFixture = readFileSync(
+  new URL("./fixtures/claude-heavy-stdout.jsonl", import.meta.url),
+  "utf8",
+)
 
 function createMockPty() {
   const dataListeners: Array<(chunk: string) => void> = []
@@ -114,7 +125,63 @@ function findLatestSendKeysCommand(commands: string[], paneTarget: string) {
   return commands.findLast((command) => command.includes(`send-keys -t ${paneTarget}`))
 }
 
+function createBackendResolutionQueryStub(paths: { codex?: string; node?: string; claude?: string } = {}) {
+  const codexPath = paths.codex ?? "C:/tools/codex.exe"
+  const nodePath = paths.node ?? "C:/Program Files/nodejs/node.exe"
+  const claudePath = paths.claude ?? "C:/tools/claude.exe"
+
+  return vi.fn(async (command: string) => {
+    if (command.includes("Failed to resolve codex.js") || command.includes("node_modules/@openai/codex/bin/codex.js")) {
+      const match = command.match(/\$commandPath = '([^']+)'/)
+      const resolvedShimPath = match?.[1] ?? codexPath
+      if (resolvedShimPath.endsWith(".js")) {
+        return resolvedShimPath
+      }
+
+      const normalizedCodexPath = resolvedShimPath.replace(/\\/g, "/")
+      const codexDirectory = normalizedCodexPath.slice(0, normalizedCodexPath.lastIndexOf("/"))
+      return `${codexDirectory}/node_modules/@openai/codex/bin/codex.js`
+    }
+
+    if (command.includes("Get-Command 'codex'")) {
+      return codexPath
+    }
+
+    if (command.includes("Get-Command 'node'")) {
+      return nodePath
+    }
+
+    if (command.includes("Get-Command 'claude'")) {
+      return claudePath
+    }
+
+    throw new Error(`Unexpected shell query: ${command}`)
+  })
+}
+
+async function createTempWorkspace() {
+  return mkdtemp(join(tmpdir(), "windows-psmux-dashboard-"))
+}
+
+async function readDashboardSnapshot(cwd: string, sessionId: string) {
+  const raw = await readFile(buildWindowsPsmuxDashboardSnapshotPath(join(cwd, ".omni-monitors"), sessionId), "utf8")
+  return JSON.parse(raw) as {
+    jobs: Array<{
+      id: string
+      status: string
+      phase?: string
+    }>
+  }
+}
+
 describe("Windows psmux dashboard layout", () => {
+  beforeEach(() => {
+    // Clean up leftover dashboard snapshots from prior tests so nextId
+    // isn't bumped by stale data in the shared .omni-monitors directory.
+    try { rmSync("D:/Omni-Opencode/.omni-monitors/parent-session-1-dashboard.json") } catch {}
+    try { rmSync("D:/Omni-Opencode/.omni-monitors/parent-session-shell-refresh-dashboard.json") } catch {}
+  })
+
   it("creates a new dashboard with only one horizontal split", async () => {
     const runPsmuxCommand = vi.fn<(command: string) => Promise<void>>(async () => undefined)
     const sessionId = "parent-session-1"
@@ -134,6 +201,7 @@ describe("Windows psmux dashboard layout", () => {
       platform: "win32",
       cwd: "D:/Omni-Opencode",
       ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runShellQuery: createBackendResolutionQueryStub(),
       runPsmuxCommand,
       hasSharedSession: async () => false,
       runPsmuxQuery,
@@ -152,7 +220,7 @@ describe("Windows psmux dashboard layout", () => {
     ])
   })
 
-  it("creates the dashboard with real split-window commands and discovers left and right pane ids from list-panes", async () => {
+  it("keeps the legacy non-delegated fallback on script-backed job windows while discovering dashboard panes", async () => {
     const runPsmuxCommand = vi.fn<(command: string) => Promise<void>>(async () => undefined)
     const sessionId = "parent-session-1"
     const binaryPath = createManagedInstallResult().binaryPath
@@ -183,6 +251,63 @@ describe("Windows psmux dashboard layout", () => {
     const queryCommands = runPsmuxQuery.mock.calls.map(([command]) => command)
     expectCommandContaining(queryCommands, `${binaryPath} new-window -P -F "#{window_index} #{pane_id}" -t ${sessionId} -n job-runtime-1 -d -- powershell.exe -NoLogo -NoProfile -File`)
     expectCommandContaining(queryCommands, 'runtime-1.ps1')
+  })
+
+  it("keeps dashboard window 0 while delegated jobs launch renderer-hosted stream-json windows 1 and 2", { timeout: 10000 }, async () => {
+    const runPsmuxCommand = vi.fn<(command: string) => Promise<void>>(async () => undefined)
+    const sessionId = "parent-session-1"
+    const binaryPath = createManagedInstallResult().binaryPath
+    const runPsmuxQuery = createDashboardRuntimeQuery({
+      sessionId,
+      dashboardResponses: [createTwoPaneDashboardGeometry()],
+      jobWindowOutputs: { "job-runtime-1": "1 %31", "job-runtime-2": "2 %41" },
+    })
+    const runtime = createRuntime({
+      platform: "win32",
+      cwd: "D:/Omni-Opencode",
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runPsmuxCommand,
+      hasSharedSession: async () => false,
+      runPsmuxQuery,
+    })
+
+    const codexJob = await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect codex window",
+        promptFingerprint: "fingerprint-codex",
+        correlationMarker: "omni-opencode:parent-session-1:message-1:codex",
+      },
+      monitorSessionId: sessionId,
+    })
+    const claudeJob = await runtime.start({
+      backend: "claude-code",
+      command: 'claude --print "hello"',
+      commandArgs: ["claude", "--print", "hello"],
+      launchMetadata: {
+        prompt: "inspect claude window",
+        promptFingerprint: "fingerprint-claude",
+        correlationMarker: "omni-opencode:parent-session-1:message-2:claude-code",
+      },
+      monitorSessionId: sessionId,
+    })
+
+    const queryCommands = runPsmuxQuery.mock.calls.map(([command]) => command)
+    expect(queryCommands.filter((command) => command.includes('new-window -P -F "#{window_index} #{pane_id}"') && command.includes('powershell.exe -NoLogo -NoProfile -File'))).toHaveLength(2)
+    const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
+    expect(commands.filter((command) => command.includes("send-keys -t %31"))).toEqual([])
+    expect(commands.filter((command) => command.includes("send-keys -t %41"))).toEqual([])
+    expect(commands.filter((command) => command.includes("send-keys -t %11") || command.includes("send-keys -t %12"))).toEqual([])
+    expect(codexJob.monitor.structuredStreamCaptureTarget).toBe("D:/Omni-Opencode/.omni-monitors/parent-session-1-runtime-1.stream.jsonl")
+    expect(claudeJob.monitor.structuredStreamCaptureTarget).toBe("D:/Omni-Opencode/.omni-monitors/parent-session-1-runtime-2.stream.jsonl")
+    expect(codexJob.monitor.launch.outputMode).toBe("stream-json-renderer")
+    expect(claudeJob.monitor.launch.outputMode).toBe("stream-json-renderer")
+    expect(codexJob.monitor.attach.windowIndex).toBe(0)
+    expect(claudeJob.monitor.attach.windowIndex).toBe(0)
+    expect(codexJob.monitor.window).toEqual({ target: `${sessionId}:1`, index: 1 })
+    expect(claudeJob.monitor.window).toEqual({ target: `${sessionId}:2`, index: 2 })
   })
 
   it("derives left and right dashboard roles from real pane geometry", () => {
@@ -231,21 +356,11 @@ describe("Windows psmux dashboard layout", () => {
       [
         "%21 0 0 0 120 60",
       ].join("\n"),
-    )).toThrow("Expected dashboard 'parent-session-1:dashboard' to have exactly 2 panes, found 1")
+    )).toThrow("Expected dashboard 'parent-session-1:dashboard' to have at least 2 panes, found 1")
   })
 
-  it("rejects a vertical top and bottom two-pane dashboard layout", () => {
-    expect(() => discoverWindowsPsmuxDashboardLayout(
-      "parent-session-1",
-      [
-        "%21 0 0 0 120 30",
-        "%22 1 0 30 120 30",
-      ].join("\n"),
-    )).toThrow("Expected dashboard 'parent-session-1:dashboard' to use a left/right split in window 0")
-  })
-
-  it("rejects overpopulated dashboard pane lists", () => {
-    expect(() => discoverWindowsPsmuxDashboardLayout(
+  it("tolerates extra panes and picks the leftmost as dashboard", () => {
+    const layout = discoverWindowsPsmuxDashboardLayout(
       "parent-session-1",
       [
         "%21 0 0 0 120 60",
@@ -253,7 +368,9 @@ describe("Windows psmux dashboard layout", () => {
         "%23 2 120 20 80 20",
         "%24 3 120 40 80 20",
       ].join("\n"),
-    )).toThrow("Expected dashboard 'parent-session-1:dashboard' to have exactly 2 panes, found 4")
+    )
+    expect(layout.panes.dashboard.target).toBe("%21")
+    expect(layout.panes.shell.target).toBe("%22")
   })
 
   it("targets the shared monitor at the dashboard window", async () => {
@@ -321,12 +438,9 @@ describe("Windows psmux dashboard layout", () => {
     const dashboardSendKeys = commands.filter((command) => command.includes("send-keys -t %11") || command.includes("send-keys -t %12"))
 
     expect(dashboardSendKeys).toEqual([])
-    // No send-keys to job panes either — agent commands run via script files
-    expect(commands.filter((command) => command.includes("send-keys -t %31"))).toEqual([])
-    expect(commands.filter((command) => command.includes("send-keys -t %41"))).toEqual([])
   })
 
-  it("does not send keys to any pane even with multiple jobs", async () => {
+  it("does not send dashboard keys even with multiple jobs", async () => {
     const runPsmuxCommand = vi.fn<(command: string) => Promise<void>>(async () => undefined)
     const hasSharedSession = vi.fn(async () => false)
     hasSharedSession.mockResolvedValueOnce(false)
@@ -375,12 +489,9 @@ describe("Windows psmux dashboard layout", () => {
     const dashboardSendKeys = commands.filter((command) => command.includes("send-keys -t %11") || command.includes("send-keys -t %12") || command.includes("send-keys -t %13"))
 
     expect(dashboardSendKeys).toEqual([])
-    expect(commands.filter((command) => command.includes("send-keys -t %31"))).toEqual([])
-    expect(commands.filter((command) => command.includes("send-keys -t %41"))).toEqual([])
-    expect(commands.filter((command) => command.includes("send-keys -t %51"))).toEqual([])
   })
 
-  it("starts each delegated job in its own real execution window instead of treating dashboard slots as canonical homes", async () => {
+  it("starts each delegated job in its own renderer-backed execution window instead of treating dashboard slots as canonical homes", { timeout: 10000 }, async () => {
     const runPsmuxCommand = vi.fn<(command: string) => Promise<void>>(async () => undefined)
     const hasSharedSession = vi.fn(async () => false)
     hasSharedSession.mockResolvedValueOnce(false)
@@ -406,37 +517,45 @@ describe("Windows psmux dashboard layout", () => {
     await runtime.start({
       backend: "codex",
       command: 'codex exec "alpha"',
+      commandArgs: ["codex", "exec", "alpha"],
+      launchMetadata: {
+        prompt: "alpha",
+        promptFingerprint: "fingerprint-alpha",
+        correlationMarker: "omni-opencode:parent-session-1:message-1:codex",
+      },
       monitorSessionId: "parent-session-1",
     })
     await runtime.start({
       backend: "claude-code",
       command: 'claude --print "beta"',
+      commandArgs: ["claude", "--print", "beta"],
+      launchMetadata: {
+        prompt: "beta",
+        promptFingerprint: "fingerprint-beta",
+        correlationMarker: "omni-opencode:parent-session-1:message-2:claude-code",
+      },
       monitorSessionId: "parent-session-1",
     })
 
     const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
     const queryCommands = runPsmuxQuery.mock.calls.map(([command]) => command)
-    const newWindowCommands = queryCommands.filter((command) => command.includes('new-window -P -F "#{window_index} #{pane_id}"'))
     const dashboardSplitCommands = commands.filter((command) => command.includes("split-window -t parent-session-1:dashboard") || command.includes("split-window -t parent-session-1:dashboard.1 -v -p 50 -d"))
     const dashboardListPaneCommands = queryCommands.filter((command) => command.includes('list-panes -t parent-session-1:dashboard -F "#{pane_id} #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{pane_height}"'))
 
-    expect(newWindowCommands[0]).toContain('psmux new-window -P -F "#{window_index} #{pane_id}" -t parent-session-1 -n job-runtime-1 -d -- powershell.exe -NoLogo -NoProfile -File')
-    expect(newWindowCommands[1]).toContain('psmux new-window -P -F "#{window_index} #{pane_id}" -t parent-session-1 -n job-runtime-2 -d -- powershell.exe -NoLogo -NoProfile -File')
-    expect(newWindowCommands[0]).toContain('runtime-1.ps1')
-    expect(newWindowCommands[1]).toContain('runtime-2.ps1')
+    expect(queryCommands.filter((command) => command.includes('new-window -P -F "#{window_index} #{pane_id}"') && command.includes('powershell.exe -NoLogo -NoProfile -File'))).toHaveLength(2)
     expect(dashboardSplitCommands).toEqual([
       'psmux split-window -t parent-session-1:dashboard -h -p 35 -d -- powershell.exe -NoLogo -NoProfile',
     ])
     expect(dashboardListPaneCommands).toHaveLength(1)
-    expectCommandContaining(commands, 'psmux pipe-pane -t %31 -o --')
-    expectCommandContaining(commands, 'runtime-1.log')
-    expectCommandContaining(commands, 'psmux pipe-pane -t %41 -o --')
-    expectCommandContaining(commands, 'runtime-2.log')
+    expect(commands.filter((command) => command.includes('pipe-pane -t %31 -o --'))).toEqual([])
+    expect(commands.filter((command) => command.includes('pipe-pane -t %41 -o --'))).toEqual([])
     expect(commands.filter((command) => command.includes("pipe-pane -t parent-session-1:job-runtime-"))).toEqual([])
     expect(runPsmuxQuery.mock.calls.filter(([command]) => command.includes('list-panes -t parent-session-1:job-runtime-') && command.includes('#{pane_id}'))).toEqual([])
     expect(commands.filter((command) => command.includes("join-pane"))).toEqual([])
     expect(queryCommands.filter((command) => command.includes("break-pane"))).toEqual([])
     expect(commands.filter((command) => command.includes("display-pane"))).toEqual([])
+    expect(commands.filter((command) => command.includes("send-keys -t %31"))).toEqual([])
+    expect(commands.filter((command) => command.includes("send-keys -t %41"))).toEqual([])
   })
 
   it("does not compose latest-job dashboard highlights with join-pane or break-pane", async () => {
@@ -630,8 +749,7 @@ describe("Windows psmux dashboard layout", () => {
     })
 
     const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
-    expectCommandContaining(commands, 'psmux pipe-pane -t %77 -o --')
-    expectCommandContaining(commands, 'runtime-1.log')
+    expect(commands.filter((command) => command.includes('pipe-pane -t %77 -o --'))).toEqual([])
     expect(runPsmuxQuery.mock.calls.filter(([command]) => command.includes('list-panes -t parent-session-1:job-runtime-1 -F "#{pane_id}"'))).toEqual([])
   })
 
@@ -672,5 +790,396 @@ describe("Windows psmux dashboard layout", () => {
 
     expect(unregistered.metadata.highlightedJobIds).toEqual(["runtime-1", "runtime-2"])
     expect(unregistered.jobIds).toEqual(["runtime-1", "runtime-2"])
+  })
+
+  it("records active dashboard phase markers and waiting approval from stream events", async () => {
+    const cwd = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardRuntimeQuery({
+        sessionId: "parent-session-1",
+        dashboardResponses: [createTwoPaneDashboardGeometry()],
+        jobWindowOutputs: { "job-runtime-1": "1 %31" },
+      }),
+    })
+
+    const job = await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect the dashboard",
+        promptFingerprint: "fingerprint-dashboard-running",
+        correlationMarker: "omni-opencode:parent-session-1:message-1:codex",
+      },
+      monitorSessionId: "parent-session-1",
+    })
+
+    await writeFile(job.monitor.transcriptCaptureTarget!, "renderer output\n", "utf8")
+    await writeFile(
+      job.monitor.structuredStreamCaptureTarget!,
+      `${JSON.stringify({ type: "thread.run.started" })}\n${JSON.stringify({ type: "approval.requested", message: "allow once" })}\n`,
+      "utf8",
+    )
+
+    await runtime.snapshot()
+    const snapshot = await readDashboardSnapshot(cwd, "parent-session-1")
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: job.id,
+        status: "waiting-approval",
+        phase: "--> approval.requested",
+      }),
+    ]))
+  })
+
+  it("keeps exact codex provider event names in a running dashboard phase with an active indicator", async () => {
+    const cwd = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardRuntimeQuery({
+        sessionId: "parent-session-1",
+        dashboardResponses: [createTwoPaneDashboardGeometry()],
+        jobWindowOutputs: { "job-runtime-1": "1 %31" },
+      }),
+    })
+
+    const job = await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect running phase",
+        promptFingerprint: "fingerprint-running-phase",
+        correlationMarker: "omni-opencode:parent-session-1:message-running:codex",
+      },
+      monitorSessionId: "parent-session-1",
+    })
+
+    await writeFile(job.monitor.transcriptCaptureTarget!, "renderer output\n", "utf8")
+    await writeFile(
+      job.monitor.structuredStreamCaptureTarget!,
+      `${JSON.stringify({ type: "item.started" })}\n`,
+      "utf8",
+    )
+
+    await runtime.snapshot()
+    const snapshot = await readDashboardSnapshot(cwd, "parent-session-1")
+    const rendered = renderDashboard(snapshot as Parameters<typeof renderDashboard>[0], 0)
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: job.id,
+        status: "running",
+        phase: "--> item.started",
+      }),
+    ]))
+    expect(rendered).toContain(job.id)
+    expect(rendered).toContain("⠋")
+    expect(rendered).toContain("\x1b[1m\x1b[97m[window 1]\x1b[0m")
+    expect(rendered).not.toContain("No delegated jobs yet. Waiting for work...")
+    expect(rendered).not.toContain("✓")
+    expect(rendered).not.toContain("✗")
+  })
+
+  it("shows latest claude event as dashboard phase while running", async () => {
+    const cwd = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardRuntimeQuery({
+        sessionId: "parent-session-1",
+        dashboardResponses: [createTwoPaneDashboardGeometry()],
+        jobWindowOutputs: { "job-runtime-1": "1 %31" },
+      }),
+    })
+
+    const job = await runtime.start({
+      backend: "claude-code",
+      command: 'claude -p "hello" --output-format stream-json',
+      commandArgs: ["claude", "-p", "hello", "--output-format", "stream-json"],
+      launchMetadata: {
+        prompt: "inspect claude streamed lifecycle phases",
+        promptFingerprint: "fingerprint-claude-lifecycle-phases",
+        correlationMarker: "omni-opencode:parent-session-1:message-noise:claude-code",
+      },
+      monitorSessionId: "parent-session-1",
+    })
+
+    await writeFile(job.monitor.transcriptCaptureTarget!, "renderer output\n", "utf8")
+    await writeFile(
+      job.monitor.structuredStreamCaptureTarget!,
+      [
+        JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "Working" } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Read", id: "tool-1", input: {} }] } }),
+        JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use" } }),
+      ].join("\n") + "\n",
+      "utf8",
+    )
+
+    await runtime.snapshot()
+    let snapshot = await readDashboardSnapshot(cwd, "parent-session-1")
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: job.id,
+        status: "running",
+        phase: "--> message_delta",
+      }),
+    ]))
+
+    await writeFile(
+      job.monitor.structuredStreamCaptureTarget!,
+      [
+        JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "Working" } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Read", id: "tool-1", input: {} }] } }),
+        JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use" } }),
+        JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" } }),
+      ].join("\n") + "\n",
+      "utf8",
+    )
+
+    await runtime.snapshot()
+    snapshot = await readDashboardSnapshot(cwd, "parent-session-1")
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: job.id,
+        status: "completed",
+        phase: "--> message_delta",
+      }),
+    ]))
+  })
+
+  it("prefers claude final result.success as the terminal dashboard phase", async () => {
+    const cwd = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardRuntimeQuery({
+        sessionId: "parent-session-1",
+        dashboardResponses: [createTwoPaneDashboardGeometry()],
+        jobWindowOutputs: { "job-runtime-1": "1 %31" },
+      }),
+    })
+
+    const job = await runtime.start({
+      backend: "claude-code",
+      command: 'claude -p "hello" --output-format stream-json',
+      commandArgs: ["claude", "-p", "hello", "--output-format", "stream-json"],
+      launchMetadata: {
+        prompt: "inspect claude result success phase",
+        promptFingerprint: "fingerprint-claude-result-success-phase",
+        correlationMarker: "omni-opencode:parent-session-1:message-result-success:claude-code",
+      },
+      monitorSessionId: "parent-session-1",
+    })
+
+    await writeFile(job.monitor.transcriptCaptureTarget!, "renderer output\n", "utf8")
+    await writeFile(job.monitor.structuredStreamCaptureTarget!, claudeHeavyStdoutFixture, "utf8")
+
+    await runtime.snapshot()
+    const snapshot = await readDashboardSnapshot(cwd, "parent-session-1")
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: job.id,
+        status: "completed",
+        phase: "--> result.success",
+      }),
+    ]))
+  })
+
+  it("updates a completed claude job to result.success when that later terminal event arrives", async () => {
+    const cwd = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardRuntimeQuery({
+        sessionId: "parent-session-1",
+        dashboardResponses: [createTwoPaneDashboardGeometry()],
+        jobWindowOutputs: { "job-runtime-1": "1 %31" },
+      }),
+    })
+
+    const job = await runtime.start({
+      backend: "claude-code",
+      command: 'claude -p "hello" --output-format stream-json',
+      commandArgs: ["claude", "-p", "hello", "--output-format", "stream-json"],
+      launchMetadata: {
+        prompt: "inspect delayed claude result success phase",
+        promptFingerprint: "fingerprint-delayed-claude-result-success-phase",
+        correlationMarker: "omni-opencode:parent-session-1:message-delayed-result-success:claude-code",
+      },
+      monitorSessionId: "parent-session-1",
+    })
+
+    const messageDeltaOnly = [
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null, stop_details: null },
+        },
+      }),
+      "",
+    ].join("\n")
+
+    const resultOnly = [
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        result: "ok",
+      }),
+      "",
+    ].join("\n")
+
+    await writeFile(job.monitor.transcriptCaptureTarget!, "renderer output\n", "utf8")
+    await writeFile(job.monitor.structuredStreamCaptureTarget!, messageDeltaOnly, "utf8")
+
+    await runtime.snapshot()
+
+    await appendFile(job.monitor.structuredStreamCaptureTarget!, resultOnly, "utf8")
+    await runtime.snapshot()
+
+    const snapshot = await readDashboardSnapshot(cwd, "parent-session-1")
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: job.id,
+        status: "completed",
+        phase: "--> result.success",
+      }),
+    ]))
+  })
+
+  it.each([
+    {
+      name: "completed",
+      backend: "codex" as const,
+      event: { type: "turn.completed" },
+      expectedStatus: "completed",
+      expectedPhase: "--> turn.completed",
+    },
+    {
+      name: "failed",
+      backend: "codex" as const,
+      event: { type: "error", message: "Containment breach" },
+      expectedStatus: "failed",
+      expectedPhase: "--> error",
+    },
+    {
+      name: "cancelled",
+      backend: "codex" as const,
+      event: { type: "turn.cancelled" },
+      expectedStatus: "cancelled",
+      expectedPhase: "--> turn.cancelled",
+    },
+  ])("retains %s dashboard lifecycle state from stream events", async ({ backend, event, expectedStatus, expectedPhase }) => {
+    const cwd = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardRuntimeQuery({
+        sessionId: "parent-session-1",
+        dashboardResponses: [createTwoPaneDashboardGeometry()],
+        jobWindowOutputs: { "job-runtime-1": "1 %31" },
+      }),
+    })
+
+    const job = await runtime.start({
+      backend,
+      command: backend === "codex" ? 'codex exec --color never "hello"' : 'claude -p "hello" --output-format stream-json',
+      commandArgs: backend === "codex"
+        ? ["codex", "exec", "--color", "never", "hello"]
+        : ["claude", "-p", "hello", "--output-format", "stream-json"],
+      launchMetadata: {
+        prompt: `inspect ${expectedStatus}`,
+        promptFingerprint: `fingerprint-${expectedStatus}`,
+        correlationMarker: `omni-opencode:parent-session-1:message-${expectedStatus}:${backend}`,
+      },
+      monitorSessionId: "parent-session-1",
+    })
+
+    await writeFile(job.monitor.transcriptCaptureTarget!, "renderer output\n", "utf8")
+    await writeFile(job.monitor.structuredStreamCaptureTarget!, `${JSON.stringify(event)}\n`, "utf8")
+
+    await runtime.snapshot()
+    const snapshot = await readDashboardSnapshot(cwd, "parent-session-1")
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: job.id,
+        status: expectedStatus,
+        phase: expectedPhase,
+      }),
+    ]))
+  })
+
+  it("keeps renderer backend spawn failures in a failed dashboard state", async () => {
+    const cwd = await createTempWorkspace()
+    const runShellQuery = createBackendResolutionQueryStub()
+    const runtime = createWindowsPsmuxRuntime({
+      ...({ runShellQuery } as object),
+      platform: "win32",
+      cwd,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardRuntimeQuery({
+        sessionId: "parent-session-1",
+        dashboardResponses: [createTwoPaneDashboardGeometry()],
+        jobWindowOutputs: { "job-runtime-1": "1 %31" },
+      }),
+    })
+
+    const job = await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect renderer spawn failure",
+        promptFingerprint: "fingerprint-renderer-spawn-failure",
+        correlationMarker: "omni-opencode:parent-session-1:message-renderer-spawn-failure:codex",
+      },
+      monitorSessionId: "parent-session-1",
+    })
+
+    await writeFile(
+      job.monitor.transcriptCaptureTarget!,
+      "[renderer] error: spawn codex ENOENT\n__OMNI_OPENCODE_PSMUX_EXIT__:1\n",
+      "utf8",
+    )
+
+    await runtime.snapshot()
+    const snapshot = await readDashboardSnapshot(cwd, "parent-session-1")
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: job.id,
+        status: "failed",
+        phase: "--> renderer exited with code 1",
+      }),
+    ]))
   })
 })

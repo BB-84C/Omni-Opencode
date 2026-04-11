@@ -188,6 +188,7 @@ export function createWindowsPtyRuntime(options: WindowsPtyRuntimeOptions = {}):
   return {
     async start(params: RuntimeStartParams): Promise<RuntimeJob> {
       const id = `runtime-${nextId++}`
+      const jobCwd = params.cwd ?? cwd
       await mkdir(logDirectory, { recursive: true })
       const sharedSessionId = params.monitorSessionId
       const sharedMonitor = sharedSessionId ? await ensureSharedWindowsMonitor(sharedMonitors, logDirectory, sharedSessionId) : undefined
@@ -196,7 +197,7 @@ export function createWindowsPtyRuntime(options: WindowsPtyRuntimeOptions = {}):
 
       const attachCommand = sharedMonitor?.attachCommand ?? buildWindowsMonitorCommand(logPath)
       const logTailCommand = sharedMonitor ? undefined : `Get-Content -Path \"${logPath}\" -Wait`
-      const monitorCwd = sharedSessionId ? resolveWindowsRuntimeWorkspaceRoot() : cwd
+      const monitorCwd = sharedSessionId ? resolveWindowsRuntimeWorkspaceRoot() : jobCwd
       const monitor: RuntimeMonitor = {
         id: sharedSessionId ? `monitor-${sharedSessionId}` : `monitor-${id}`,
         sessionId: sharedSessionId,
@@ -218,21 +219,21 @@ export function createWindowsPtyRuntime(options: WindowsPtyRuntimeOptions = {}):
             backend: params.backend,
             shell,
             command: params.command,
-            cwd,
+            cwd: jobCwd,
             env,
             logDirectory,
             initialOffset: await readSharedEventBaseline(resolveWindowsMultiplexerEventPath(logDirectory, sharedSessionId)),
           })
         : options.spawn
           ? options.spawn(shell, ["-NoLogo", "-NoProfile", "-Command", params.command], {
-              cwd,
+              cwd: jobCwd,
               env,
               name: "xterm-color",
             })
           : await launchHelper({
               shell,
               command: params.command,
-              cwd,
+              cwd: jobCwd,
               env,
               backend: params.backend,
               jobId: id,

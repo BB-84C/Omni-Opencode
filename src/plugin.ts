@@ -1,8 +1,27 @@
 import { tool, type PluginInput, type Plugin } from "@opencode-ai/plugin"
+import { createHash } from "node:crypto"
 import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { createJobStore } from "./core/store.js"
-import type { Backend, JobRecord } from "./core/jobs.js"
+import type { ApprovalMode, Backend, DelegationTaskClass, JobRecord, PermissionProfile } from "./core/jobs.js"
+import {
+  classifyDelegationTask,
+  normalizeDelegationApprovalChoice,
+} from "./core/session-approval-state.js"
+import {
+  createDelegationGrantStore,
+  findMatchingDelegationGrant,
+  type DelegatedSessionCapability,
+} from "./core/delegation-grants.js"
+import {
+  deriveDelegationCapabilities,
+  fingerprintDelegationCapabilities,
+  type DelegationCapabilities,
+} from "./core/delegation-permissions.js"
+import type { DelegatedCapabilityDecision } from "./core/delegation-permissions.js"
+import { readDelegationLaunchContext } from "./core/delegation-launch-context.js"
+import { toClaudeCapabilityPolicy } from "./adapters/policy-mappers.js"
+import { toCodexCapabilityPolicy } from "./adapters/policy-mappers.js"
 import { extractFinalReport } from "./runtime/extract-report.js"
 import { selectRuntime, type SelectRuntimeOptions, type SelectedRuntime } from "./runtime/select-runtime.js"
 import { appendTranscriptChunk, createTranscript } from "./runtime/transcript.js"
@@ -61,6 +80,20 @@ function buildDelegationCommand(backend: Backend, prompt: string): string {
     : `codex exec --color never ${escapedPrompt}`
 }
 
+function buildDelegationCommandArgs(backend: Backend, prompt: string): string[] {
+  return backend === "claude-code"
+    ? ["claude", "--print", prompt]
+    : ["codex", "exec", "--color", "never", prompt]
+}
+
+function buildPromptFingerprint(prompt: string): string {
+  return createHash("sha256").update(prompt).digest("hex")
+}
+
+function buildCorrelationMarker(parentSessionId: string, parentMessageId: string, backend: Backend): string {
+  return `omni-opencode:${parentSessionId}:${parentMessageId}:${backend}`
+}
+
 export function createStoredJobRecord(
   batchId: string,
   parentSessionId: string,
@@ -68,6 +101,12 @@ export function createStoredJobRecord(
   runtimeKind: SelectedRuntime["kind"],
   job: RuntimeJob,
   monitor: RuntimeMonitor,
+  launchMetadata: RuntimeStartParams["launchMetadata"],
+  delegationMetadata: {
+    taskClass: DelegationTaskClass
+    permissionProfile: PermissionProfile
+    approvalMode: ApprovalMode
+  },
   status: JobRecord["status"],
   autoOpenAttempted: boolean,
   autoOpenSucceeded: boolean,
@@ -80,6 +119,8 @@ export function createStoredJobRecord(
     batchId,
     parentSessionId,
     parentMessageId,
+    promptFingerprint: launchMetadata?.promptFingerprint,
+    correlationMarker: launchMetadata?.correlationMarker,
     monitorSessionId,
     runtimeKind,
     runtimeType: runtimeTypeForSelection(runtimeKind),
@@ -93,6 +134,10 @@ export function createStoredJobRecord(
     transcriptChunkCount: 0,
     backend: job.backend,
     backendThreadId: job.id,
+    ...extractRuntimeBackendSession(job),
+    taskClass: delegationMetadata.taskClass,
+    permissionProfile: delegationMetadata.permissionProfile,
+    approvalMode: delegationMetadata.approvalMode,
     status,
     autoOpenAttempted,
     autoOpenSucceeded,
@@ -128,6 +173,49 @@ type DelegationLaunchResult = {
   autoOpenAttempted: boolean
   autoOpenSucceeded: boolean
   monitor: RuntimeMonitor
+}
+
+type DelegationExecutionContext = {
+  sessionID: string
+  messageID: string
+  agent?: string
+  permissions?: unknown
+  externalDirectories?: unknown
+  directory?: string
+  worktree?: string
+  ask?: unknown
+}
+
+const DELEGATED_CAPABILITY_ORDER: DelegatedSessionCapability[] = [
+  "workspaceWrite",
+  "shell",
+  "network",
+  "subagentLaunch",
+]
+
+const DELEGATED_CAPABILITY_LABELS: Record<DelegatedSessionCapability, string> = {
+  workspaceWrite: "file edits",
+  shell: "shell commands",
+  network: "network access",
+  subagentLaunch: "subagent launches",
+}
+
+function askCapabilities(capabilities: DelegationCapabilities): DelegatedSessionCapability[] {
+  return DELEGATED_CAPABILITY_ORDER.filter(capability => capabilities[capability] === "ask")
+}
+
+function formatCapabilityNames(capabilities: readonly DelegatedSessionCapability[]): string {
+  const names = capabilities.map(capability => DELEGATED_CAPABILITY_LABELS[capability])
+
+  if (names.length <= 1) {
+    return names[0] ?? "delegated capabilities"
+  }
+
+  if (names.length === 2) {
+    return `${names[0]} and ${names[1]}`
+  }
+
+  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`
 }
 
 function monitorAttachCommand(monitor: RuntimeMonitor): string {
@@ -198,12 +286,50 @@ type ParentSessionMessageClient = PluginInput["client"] & {
   }
 }
 
+function extractRuntimeBackendSession(job: RuntimeJob): Pick<JobRecord, "backendSessionId" | "backendResumeSessionId"> {
+  const candidate = job as RuntimeJob & {
+    backendSessionId?: unknown
+    backendResumeSessionId?: unknown
+    backendSession?: {
+      sessionId?: unknown
+      resumeSessionId?: unknown
+    }
+  }
+
+  return {
+    backendSessionId: normalizeOptionalString(candidate.backendSessionId)
+      ?? normalizeOptionalString(candidate.backendSession?.sessionId),
+    backendResumeSessionId: normalizeOptionalString(candidate.backendResumeSessionId)
+      ?? normalizeOptionalString(candidate.backendSession?.resumeSessionId),
+  }
+}
+
+function mergeRuntimeBackendSession(record: StoredJobRecord, job: RuntimeJob): StoredJobRecord {
+  const backendSession = extractRuntimeBackendSession(job)
+
+  return {
+    ...record,
+    backendSessionId: backendSession.backendSessionId ?? record.backendSessionId,
+    backendResumeSessionId: backendSession.backendResumeSessionId ?? record.backendResumeSessionId,
+  }
+}
+
+function normalizeOptionalString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined
+  }
+
+  const normalized = value.trim()
+  return normalized.length > 0 ? normalized : undefined
+}
+
 export const id = "omni-opencode"
 
 export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginInput) => {
   const stateDir = `${directory}/.broker-state`
   const finalStateOverlayDir = join(stateDir, "final-state-overlay")
   const store = createJobStore(stateDir)
+  const delegationGrantStore = createDelegationGrantStore(join(stateDir, "delegation-grants"))
   const finalStateOverlay = await loadFinalStateOverlay(finalStateOverlayDir)
   const runtimeSelection = createPluginRuntimeSelection()
   const messageClient = client as ParentSessionMessageClient
@@ -215,6 +341,10 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
   const delegationLaunchedTurns = new Set<string>()
   const reportedBatchIds = new Set<string>()
   const reportingBatchIds = new Set<string>()
+  const pendingSessionRetries = new Set<string>()
+  const scheduledSessionRetries = new Map<string, NodeJS.Timeout>()
+  const reportedJobIds = new Set<string>()
+  const activeBatchLaunches = new Map<string, number>()
   const transcriptByJobId = new Map<string, string>()
   const transcriptReadOffsets = new Map<string, number>()
 
@@ -222,35 +352,38 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     return (await listJobRecords()).filter((job) => job.batchId === batchId)
   }
 
-  function formatBatchCompletionUpdate(batchId: string, jobs: StoredJobRecord[]): string {
-    const header = `Delegated batch ${batchId} finished. ${jobs.length} job(s) reached terminal status.`
-    const details = jobs
+  async function listJobRecordsBySession(sessionId: string): Promise<StoredJobRecord[]> {
+    return (await listJobRecords()).filter((job) => job.parentSessionId === sessionId)
+  }
+
+  function formatParentFacingJobStatus(job: StoredJobRecord): string {
+    return job.cleanupReason === "cancelled" || job.status === "interrupted"
+      ? "cancelled"
+      : job.status
+  }
+
+  function formatSessionCompletionUpdate(sessionId: string, jobs: StoredJobRecord[]): string {
+    const newJobs = jobs.filter((job) => !reportedJobIds.has(job.jobId))
+    if (newJobs.length === 0) {
+      return `All delegated jobs in session ${sessionId} finished (no new jobs to report).`
+    }
+    const header = `${newJobs.length} delegated job(s) finished.`
+    const details = newJobs
       .map((job) => {
-        const inspectionRefs = [
-          `delegated_job_snapshot({\"jobId\":\"${job.jobId}\"})`,
-          `delegated_job_read({\"jobId\":\"${job.jobId}\"})`,
-          `delegated_job_attach({\"jobId\":\"${job.jobId}\"})`,
-          job.attachCommand ? `attach: ${job.attachCommand}` : null,
-          job.logTailCommand ? `log tail: ${job.logTailCommand}` : null,
-        ].filter(Boolean).join(" | ")
-
-        const autoOpen = job.autoOpenAttempted
-          ? (job.autoOpenSucceeded ? "auto-opened" : "auto-open failed")
-          : "auto-open not attempted"
-
-        return [
-          `- ${job.jobId} [${job.backend}] ${job.status}: ${job.summary ?? "No structured summary."}`,
-          `  monitor=${autoOpen}`,
-          `  inspect: ${inspectionRefs}`,
-        ].join("\n")
+        const status = formatParentFacingJobStatus(job)
+        return `- ${job.jobId} [${job.backend}] ${status} | snapshot: delegated_job_snapshot({\"jobId\":\"${job.jobId}\"}) | transcript: delegated_job_read({\"jobId\":\"${job.jobId}\"}) | monitor: delegated_job_attach({\"jobId\":\"${job.jobId}\"})`
       })
       .join("\n")
 
     return `${header}\n${details}`
   }
 
-  async function markBatchReported(batchId: string, content: string): Promise<void> {
-    const jobs = await listJobRecordsByBatch(batchId)
+  async function markSessionReported(sessionId: string, content: string): Promise<void> {
+    const jobs = await listJobRecordsBySession(sessionId)
+
+    for (const job of jobs) {
+      reportedJobIds.add(job.jobId)
+    }
 
     await Promise.all(jobs.map((job) => saveFinalStateAfterParentUpdate({
       ...job,
@@ -258,42 +391,116 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     })))
   }
 
-  async function maybeReportBatchCompletion(batchId: string | undefined): Promise<void> {
-    if (!batchId || reportedBatchIds.has(batchId) || reportingBatchIds.has(batchId)) {
+  function decrementSessionLaunches(sessionId: string): void {
+    const remaining = (activeBatchLaunches.get(sessionId) ?? 1) - 1
+    if (remaining <= 0) {
+      activeBatchLaunches.delete(sessionId)
+      // Re-check session completion now that all launches have settled —
+      // a monitor may have tried to report while launches were still in-flight.
+      void maybeReportSessionCompletion(sessionId)
+    } else {
+      activeBatchLaunches.set(sessionId, remaining)
+    }
+  }
+
+  function scheduleSessionCompletionRetry(sessionId: string | undefined): void {
+    if (!sessionId || reportedBatchIds.has(sessionId) || scheduledSessionRetries.has(sessionId)) {
       return
     }
 
-    const jobs = await listJobRecordsByBatch(batchId)
-    if (jobs.length === 0 || jobs.some((job) => !isTerminalJob(job))) {
+    const timer = setTimeout(() => {
+      scheduledSessionRetries.delete(sessionId)
+      void maybeReportSessionCompletion(sessionId)
+    }, 150)
+    scheduledSessionRetries.set(sessionId, timer)
+  }
+
+  async function maybeReportSessionCompletion(sessionId: string | undefined): Promise<void> {
+    if (!sessionId || reportedBatchIds.has(sessionId)) {
       return
     }
 
-    reportingBatchIds.add(batchId)
+    // Don't report if there are still in-flight launches for this session —
+    // other jobs may not have been created/saved yet.
+    const inFlight = activeBatchLaunches.get(sessionId) ?? 0
+    if (inFlight > 0) {
+      scheduleSessionCompletionRetry(sessionId)
+      return
+    }
+
+    // If another check is already in progress, queue a retry after it finishes
+    // rather than silently bailing — the in-progress check might not see our
+    // job's terminal state yet.
+    if (reportingBatchIds.has(sessionId)) {
+      pendingSessionRetries.add(sessionId)
+      return
+    }
+
+    reportingBatchIds.add(sessionId)
+
     try {
-      const completedJobs = await listJobRecordsByBatch(batchId)
+      const jobs = await listJobRecordsBySession(sessionId)
+      if (jobs.length === 0 || jobs.some((job) => !isTerminalJob(job))) {
+        scheduleSessionCompletionRetry(sessionId)
+        return
+      }
+
+      const completedJobs = await listJobRecordsBySession(sessionId)
       if (completedJobs.length === 0 || completedJobs.some((job) => !isTerminalJob(job))) {
+        scheduleSessionCompletionRetry(sessionId)
         return
       }
 
-      const content = formatBatchCompletionUpdate(batchId, completedJobs)
+      // Seed reportedJobIds from jobs that were already reported in a prior
+      // plugin instance (they have lastProjectedMessage set in the store).
+      for (const job of completedJobs) {
+        if (job.lastProjectedMessage) {
+          reportedJobIds.add(job.jobId)
+        }
+      }
+
+      const newJobs = completedJobs.filter((job) => !reportedJobIds.has(job.jobId))
+      if (newJobs.length === 0) {
+        // All jobs were already reported in a previous batch — nothing new to inject.
+        reportedBatchIds.add(sessionId)
+        await markSessionReported(sessionId, "")
+        return
+      }
+
+      const content = formatSessionCompletionUpdate(sessionId, completedJobs)
       if (!canReportToParent) {
-        const failureContent = `Delegated batch ${batchId} finished, but the aggregate follow-up could not be injected: no parent session reporting api is available`
-        reportedBatchIds.add(batchId)
-        await markBatchReported(batchId, failureContent)
+        const failureContent = `All delegated jobs in session ${sessionId} finished, but the aggregate follow-up could not be injected: no parent session reporting api is available`
+        reportedBatchIds.add(sessionId)
+        await markSessionReported(sessionId, failureContent)
         return
       }
 
-      await reportBatchToParentSession(completedJobs[0]!.parentSessionId, content)
+      await reportBatchToParentSession(sessionId, content)
 
-      reportedBatchIds.add(batchId)
-      await markBatchReported(batchId, content)
+      reportedBatchIds.add(sessionId)
+      const scheduledRetry = scheduledSessionRetries.get(sessionId)
+      if (scheduledRetry) {
+        clearTimeout(scheduledRetry)
+        scheduledSessionRetries.delete(sessionId)
+      }
+      await markSessionReported(sessionId, content)
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
-      const content = `Delegated batch ${batchId} finished, but the aggregate follow-up could not be injected: ${detail}`
-      reportedBatchIds.add(batchId)
-      await markBatchReported(batchId, content)
+      const content = `All delegated jobs in session ${sessionId} finished, but the aggregate follow-up could not be injected: ${detail}`
+      reportedBatchIds.add(sessionId)
+      const scheduledRetry = scheduledSessionRetries.get(sessionId)
+      if (scheduledRetry) {
+        clearTimeout(scheduledRetry)
+        scheduledSessionRetries.delete(sessionId)
+      }
+      await markSessionReported(sessionId, content)
     } finally {
-      reportingBatchIds.delete(batchId)
+      reportingBatchIds.delete(sessionId)
+      // If another monitor requested a retry while we were checking, run it now.
+      if (pendingSessionRetries.has(sessionId)) {
+        pendingSessionRetries.delete(sessionId)
+        scheduleSessionCompletionRetry(sessionId)
+      }
     }
   }
 
@@ -353,27 +560,32 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           status: "failed",
           summary,
         }, "failed"))
-        await maybeReportBatchCompletion(latest.batchId)
+        await maybeReportSessionCompletion(latest.parentSessionId)
         return
       }
 
+      const latest = await getJobRecord(record.jobId)
+      if (!latest || latest.status !== "running") {
+        return
+      }
+
+      const correlatedJob = mergeRuntimeBackendSession(latest, runtimeJob)
+
       if (runtimeJob.status === "stopped") {
-        const latest = await getJobRecord(record.jobId)
-        if (!latest || latest.status !== "running") {
-          return
-        }
         const report = extractFinalReport(transcript)
         const summary = report.summary ?? "Runtime completed without a structured summary."
         const completedRecord = withCleanup({
-          ...withTranscriptProgress(latest, transcript),
+          ...withTranscriptProgress(correlatedJob, transcript),
           status: "completed",
           summary,
           changedFiles: report.changedFiles,
         }, "completed")
         await saveFinalStateAfterParentUpdate(completedRecord)
-        await maybeReportBatchCompletion(completedRecord.batchId)
+        await maybeReportSessionCompletion(completedRecord.parentSessionId)
         return
       }
+
+      await saveJobRecord(correlatedJob)
 
       await delay(50)
     }
@@ -397,18 +609,30 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     }, "failed")
 
     await saveFinalStateAfterParentUpdate(failedRecord)
-    await maybeReportBatchCompletion(failedRecord.batchId)
+    await maybeReportSessionCompletion(failedRecord.parentSessionId)
   }
 
   async function saveFinalStateAfterParentUpdate(record: StoredJobRecord): Promise<void> {
+    const existing = (finalStateOverlay.get(record.jobId) ?? await store.get(record.jobId)) as StoredJobRecord | undefined
+    const effectiveRecord = existing && existing.status !== "running" && (
+      existing.status !== record.status || existing.cleanupReason !== record.cleanupReason
+    )
+      ? {
+          ...existing,
+          lastProjectedMessage: record.lastProjectedMessage ?? existing.lastProjectedMessage,
+          backendSessionId: record.backendSessionId ?? existing.backendSessionId,
+          backendResumeSessionId: record.backendResumeSessionId ?? existing.backendResumeSessionId,
+        }
+      : record
+
     try {
-      await store.save(record)
-      finalStateOverlay.delete(record.jobId)
-      await deleteOverlayRecord(finalStateOverlayDir, record.jobId)
+      await store.save(effectiveRecord)
+      finalStateOverlay.delete(effectiveRecord.jobId)
+      await deleteOverlayRecord(finalStateOverlayDir, effectiveRecord.jobId)
     } catch {
       // The parent session already received the update; keep reads consistent in-process and across restart.
-      finalStateOverlay.set(record.jobId, record)
-      await writeOverlayRecord(finalStateOverlayDir, record)
+      finalStateOverlay.set(effectiveRecord.jobId, effectiveRecord)
+      await writeOverlayRecord(finalStateOverlayDir, effectiveRecord)
     }
   }
 
@@ -470,15 +694,116 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     return Array.from(merged.values()) as StoredJobRecord[]
   }
 
+  async function resolveApprovalMode(
+    context: DelegationExecutionContext,
+    backend: Backend,
+    prompt: string,
+    launchContext?: Awaited<ReturnType<typeof readDelegationLaunchContext>>,
+    capabilities?: DelegationCapabilities,
+  ): Promise<{ approvalMode: ApprovalMode; effectiveCapabilities: DelegationCapabilities }> {
+    const resolvedLaunchContext = launchContext ?? await readDelegationLaunchContext(context)
+    const resolvedCapabilities = capabilities ?? deriveDelegationCapabilities(resolvedLaunchContext.permissionInput)
+    const permissionEnvelopeFingerprint = fingerprintDelegationCapabilities(resolvedCapabilities)
+    const grantedCapabilities = await delegationGrantStore.get(context.sessionID)
+    const grantedAskCapabilities = askCapabilities(resolvedCapabilities).filter(capability => findMatchingDelegationGrant({
+      grants: grantedCapabilities,
+      parentSessionId: context.sessionID,
+      backend,
+      agentKey: resolvedLaunchContext.agentKey,
+      permissionEnvelopeFingerprint,
+      capability,
+      workspaceRoot: resolvedLaunchContext.workspaceRoot,
+      scope: "session",
+    }))
+    const unresolvedCapabilities = askCapabilities(resolvedCapabilities).filter(capability => !grantedAskCapabilities.includes(capability))
+
+    if (unresolvedCapabilities.length === 0) {
+      return {
+        approvalMode: askCapabilities(resolvedCapabilities).length > 0 ? "session" : "not-required",
+        effectiveCapabilities: applyDelegationCapabilityDecisions(resolvedCapabilities, grantedAskCapabilities, "allow"),
+      }
+    }
+
+    const response = typeof context.ask === "function"
+      ? await (context.ask as (input: unknown) => Promise<unknown>)({
+        title: "Delegated capability approval required",
+        description: `This delegated task requires approval for ${formatCapabilityNames(unresolvedCapabilities)}. Prompt: ${prompt}`,
+        options: ["allow-once", "allow-session", "deny"],
+      })
+      : undefined
+    const choice = normalizeDelegationApprovalChoice(response)
+
+    if (choice === "session") {
+      await Promise.all(unresolvedCapabilities.map(capability => delegationGrantStore.save({
+        parentSessionId: context.sessionID,
+        backend,
+        agentKey: resolvedLaunchContext.agentKey,
+        permissionEnvelopeFingerprint,
+        capability,
+        workspaceRoot: resolvedLaunchContext.workspaceRoot,
+        scope: "session",
+        approvedAt: Date.now(),
+      })))
+    }
+
+    if (choice === "deny") {
+      throw new Error("Delegated capabilities were not approved")
+    }
+
+    return {
+      approvalMode: choice,
+      effectiveCapabilities: applyDelegationCapabilityDecisions(
+        resolvedCapabilities,
+        [...grantedAskCapabilities, ...unresolvedCapabilities],
+        "allow",
+      ),
+    }
+  }
+
+  function applyDelegationCapabilityDecisions(
+    capabilities: DelegationCapabilities,
+    capabilityKeys: readonly DelegatedSessionCapability[],
+    decision: DelegatedCapabilityDecision,
+  ): DelegationCapabilities {
+    if (capabilityKeys.length === 0) {
+      return capabilities
+    }
+
+    const effectiveCapabilities = { ...capabilities }
+
+    for (const capability of capabilityKeys) {
+      effectiveCapabilities[capability] = decision
+    }
+
+    return effectiveCapabilities
+  }
+
   async function launchDelegation(
-    parentSessionId: string,
-    parentMessageId: string,
+    context: DelegationExecutionContext,
     backend: Backend,
     prompt: string,
   ): Promise<string> {
+    const parentSessionId = context.sessionID
+    const parentMessageId = context.messageID
+    const delegationMetadata = classifyDelegationTask(prompt)
+    const currentLaunchContext = await readDelegationLaunchContext(context)
+    const capabilities = deriveDelegationCapabilities(currentLaunchContext.permissionInput)
+    const { approvalMode, effectiveCapabilities } = await resolveApprovalMode(context, backend, prompt, currentLaunchContext, capabilities)
+    const promptFingerprint = buildPromptFingerprint(prompt)
+    const correlationMarker = buildCorrelationMarker(parentSessionId, parentMessageId, backend)
+    const launchMetadata = {
+      prompt,
+      promptFingerprint,
+      correlationMarker,
+      ...(backend === "claude-code" ? { claudePolicy: toClaudeCapabilityPolicy(effectiveCapabilities) } : {}),
+      ...(backend === "codex" ? { codexPolicy: toCodexCapabilityPolicy(effectiveCapabilities) } : {}),
+    }
     const started = await preparePluginRuntimeStart(runtimeSelection, {
       backend,
       command: buildDelegationCommand(backend, prompt),
+      cwd: currentLaunchContext.runtimeCwd,
+      commandArgs: buildDelegationCommandArgs(backend, prompt),
+      launchMetadata,
       monitorSessionId: parentSessionId,
     })
     const monitor = started.monitor ?? started.job.monitor
@@ -494,6 +819,11 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
       started.kind,
       started.job,
       monitor,
+      launchMetadata,
+      {
+        ...delegationMetadata,
+        approvalMode,
+      },
       "running",
       runtimeSelection.autoOpenMonitor,
       autoOpenSucceeded,
@@ -618,7 +948,15 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           const currentTurn = turnKey(context.sessionID, context.messageID)
           delegationRequiredTurns.delete(currentTurn)
           delegationLaunchedTurns.add(currentTurn)
-          return launchDelegation(context.sessionID, context.messageID, "claude-code", prompt)
+          const sessionId = context.sessionID
+          reportedBatchIds.delete(sessionId)
+          activeBatchLaunches.set(sessionId, (activeBatchLaunches.get(sessionId) ?? 0) + 1)
+          scheduleSessionCompletionRetry(sessionId)
+          try {
+            return await launchDelegation(context, "claude-code", prompt)
+          } finally {
+            decrementSessionLaunches(sessionId)
+          }
         },
       }),
 
@@ -632,7 +970,15 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           const currentTurn = turnKey(context.sessionID, context.messageID)
           delegationRequiredTurns.delete(currentTurn)
           delegationLaunchedTurns.add(currentTurn)
-          return launchDelegation(context.sessionID, context.messageID, "codex", prompt)
+          const sessionId = context.sessionID
+          reportedBatchIds.delete(sessionId)
+          activeBatchLaunches.set(sessionId, (activeBatchLaunches.get(sessionId) ?? 0) + 1)
+          scheduleSessionCompletionRetry(sessionId)
+          try {
+            return await launchDelegation(context, "codex", prompt)
+          } finally {
+            decrementSessionLaunches(sessionId)
+          }
         },
       }),
 
@@ -746,12 +1092,18 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           if (!job) return `No delegated job found for ID ${jobId}`
           if (job.status !== "running")
             return `Delegated job ${jobId} is not running (status: ${job.status})`
-          await runtimeSelection.runtime.stop(job.runtimeHandle)
           const interruptedJob = withCleanup({ ...job, status: "interrupted" }, "cancelled")
           finalStateOverlay.set(jobId, interruptedJob)
-          await writeOverlayRecord(finalStateOverlayDir, interruptedJob)
+          try {
+            await writeOverlayRecord(finalStateOverlayDir, interruptedJob)
+            await runtimeSelection.runtime.stop(job.runtimeHandle)
+          } catch (error) {
+            finalStateOverlay.delete(jobId)
+            await deleteOverlayRecord(finalStateOverlayDir, jobId)
+            throw error
+          }
           await saveJobRecord(interruptedJob)
-          await maybeReportBatchCompletion(interruptedJob.batchId)
+          await maybeReportSessionCompletion(interruptedJob.parentSessionId)
           return `Cancelled delegated job ${jobId}`
         },
       }),

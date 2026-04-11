@@ -16,7 +16,7 @@ export function buildDashboardProcessInlineCommand(snapshotPath: string): string
 const fs = require('fs');
 const POLL = 500;
 const SPINNERS = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
-const A = { reset:'\\x1b[0m', bold:'\\x1b[1m', dim:'\\x1b[2m', cyan:'\\x1b[36m', green:'\\x1b[32m', red:'\\x1b[31m', yellow:'\\x1b[33m', blue:'\\x1b[34m', white:'\\x1b[37m', gray:'\\x1b[90m' };
+const A = { reset:'\\x1b[0m', bold:'\\x1b[1m', dim:'\\x1b[2m', cyan:'\\x1b[36m', green:'\\x1b[32m', red:'\\x1b[31m', yellow:'\\x1b[33m', blue:'\\x1b[34m', white:'\\x1b[37m', gray:'\\x1b[90m', brightWhite:'\\x1b[97m' };
 let lastVersion = -1;
 let frame = 0;
 let lastSnapshot = null;
@@ -43,7 +43,7 @@ function render(snap, f) {
     lines.push('', '  ' + A.bold + 'Delegated Jobs' + A.reset, '');
     for (const j of snap.jobs) {
       const lbl = j.label ? ' ' + A.gray + '(' + j.label + ')' + A.reset : '';
-      lines.push('  ' + statusMarker(j.status, f) + ' ' + statusColor(j.status) + j.id + A.reset + ' ' + A.dim + '[' + j.backend + ']' + A.reset + ' -> ' + A.blue + 'window ' + j.windowIndex + A.reset + lbl);
+      lines.push('  ' + statusMarker(j.status, f) + ' ' + statusColor(j.status) + j.id + A.reset + ' ' + A.dim + '[' + j.backend + ']' + A.reset + ' -> ' + A.bold + A.brightWhite + '[window ' + j.windowIndex + ']' + A.reset + lbl);
     }
     lines.push('');
   }

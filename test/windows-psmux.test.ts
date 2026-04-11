@@ -1,13 +1,14 @@
-import { describe, expect, it, vi } from "vitest"
-import { mkdtemp, writeFile } from "node:fs/promises"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+import { rmSync } from "node:fs"
+import { spawn } from "node:child_process"
+import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { createJobStore } from "../src/core/store.js"
-import { createStoredJobRecord } from "../src/plugin.js"
 import { selectRuntime } from "../src/runtime/select-runtime.js"
 import { ARCHIVED_RUNTIME_KINDS } from "../src/runtime/types.js"
 import type { Runtime, RuntimeJob, RuntimeMonitor, RuntimeReadResult, RuntimeSnapshot } from "../src/runtime/types.js"
 import { createWindowsPsmuxRuntime } from "../src/runtime/windows-psmux.js"
+import * as windowsPsmuxModule from "../src/runtime/windows-psmux.js"
 import { makeContext } from "./helpers/delegation-plugin-fixture.js"
 
 const MANAGED_BINARY_PATH = "D:/Omni-Opencode/.omni-tools/psmux/3.3.1/win32-x64/psmux.exe"
@@ -26,7 +27,7 @@ function createDashboardQueryStub(binaryPath = MANAGED_BINARY_PATH) {
       ].join("\n")
     }
 
-    const newWindowMatch = command.match(new RegExp(`^${escapeRegex(binaryPath)} new-window -P -F "#{window_index} #{pane_id}" -t ([^ ]+) -n job-runtime-(\\d+) -d -- `))
+    const newWindowMatch = command.match(new RegExp(`^${escapeRegex(binaryPath)} new-window -P -F "#{window_index} #{pane_id}" -t ([^ ]+) -n job-runtime-(\\d+)(?: -c .+?)? -d -- `))
     if (newWindowMatch) {
       return `${Number(newWindowMatch[2])} %${Number(newWindowMatch[2]) * 10 + 21}`
     }
@@ -54,7 +55,7 @@ function createTwoPaneDashboardQueryStub(binaryPath = MANAGED_BINARY_PATH) {
       ].join("\n")
     }
 
-    const newWindowMatch = command.match(new RegExp(`^${escapeRegex(binaryPath)} new-window -P -F "#{window_index} #{pane_id}" -t ([^ ]+) -n job-runtime-(\\d+) -d -- `))
+    const newWindowMatch = command.match(new RegExp(`^${escapeRegex(binaryPath)} new-window -P -F "#{window_index} #{pane_id}" -t ([^ ]+) -n job-runtime-(\\d+)(?: -c .+?)? -d -- `))
     if (newWindowMatch) {
       return `${Number(newWindowMatch[2])} %${Number(newWindowMatch[2]) * 10 + 21}`
     }
@@ -114,6 +115,46 @@ function stubDashboardProcessCommand(snapshotPath: string): string {
   return `node --dashboard-process "${snapshotPath}"`
 }
 
+function createBackendResolutionQueryStub(paths: { codex?: string; codexCmd?: string; node?: string; claude?: string } = {}) {
+  const codexPath = paths.codex ?? "C:/tools/codex.exe"
+  const codexCmdPath = paths.codexCmd ?? "C:/Users/test/AppData/Roaming/npm/codex.cmd"
+  const nodePath = paths.node ?? "C:/Program Files/nodejs/node.exe"
+  const claudePath = paths.claude ?? "C:/tools/claude.exe"
+
+  return vi.fn(async (command: string) => {
+    if (command.includes("Failed to resolve codex.js") || command.includes("node_modules/@openai/codex/bin/codex.js")) {
+      const match = command.match(/\$commandPath = '([^']+)'/)
+      const resolvedShimPath = match?.[1]
+        ?? (command.includes(codexCmdPath) ? codexCmdPath : codexPath)
+      if (resolvedShimPath.endsWith(".js")) {
+        return resolvedShimPath
+      }
+
+      const normalizedCodexPath = resolvedShimPath.replace(/\\/g, "/")
+      const codexDirectory = normalizedCodexPath.slice(0, normalizedCodexPath.lastIndexOf("/"))
+      return `${codexDirectory}/node_modules/@openai/codex/bin/codex.js`
+    }
+
+    if (command.includes("Get-Command 'codex.cmd'")) {
+      return codexCmdPath
+    }
+
+    if (command.includes("Get-Command 'codex'")) {
+      return codexPath
+    }
+
+    if (command.includes("Get-Command 'node'")) {
+      return nodePath
+    }
+
+    if (command.includes("Get-Command 'claude'")) {
+      return claudePath
+    }
+
+    throw new Error(`Unexpected shell query: ${command}`)
+  })
+}
+
 const CUSTOM_MANAGED_BINARY_PATH = "D:/custom-tools/psmux.exe"
 
 function createStubRuntime(mode: "pty" | "tmux"): Runtime {
@@ -152,7 +193,92 @@ async function createTempWorkspace(): Promise<string> {
   return mkdtemp(join(tmpdir(), "windows-psmux-"))
 }
 
+async function runNodeScript(
+  scriptPath: string,
+  args: string[],
+): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [scriptPath, ...args], {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    })
+    let stdout = ""
+    let stderr = ""
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString()
+    })
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString()
+    })
+    child.on("error", reject)
+    child.on("close", (exitCode) => {
+      resolve({ exitCode, stdout, stderr })
+    })
+  })
+}
+
+function buildExpectedDelegatedTranscriptHeader(prompt: string): string[] {
+  return [
+    "[omni-opencode] prompt",
+    prompt,
+    "------------------------------",
+  ]
+}
+
+function encodeDelegatedTranscriptHeader(prompt: string): string {
+  return Buffer.from(`${buildExpectedDelegatedTranscriptHeader(prompt).join("\n")}\n`, "utf8").toString("base64")
+}
+
+function buildClaudeBackendScriptWithPolicy(
+  backendCommand: string,
+  promptText: string,
+  policy: {
+    allowedTools: string[]
+    disallowedTools: string[]
+    permissionMode: string
+  },
+) {
+  const builder = (windowsPsmuxModule as {
+    buildWindowsPsmuxClaudeBackendScript?: (
+      backendCommand: string,
+      promptText: string,
+      policy: {
+        allowedTools: string[]
+        disallowedTools: string[]
+        permissionMode: string
+      },
+    ) => string
+  }).buildWindowsPsmuxClaudeBackendScript
+
+  if (typeof builder !== "function") {
+    throw new Error("Expected windows-psmux to export buildWindowsPsmuxClaudeBackendScript")
+  }
+
+  return builder(backendCommand, promptText, policy)
+}
+
+type ExpectedCodexPolicy = {
+  sandboxMode: "read-only" | "workspace-write"
+  writableRoots: string[]
+  networkAccess: boolean
+  approvalPolicy: string
+}
+
 describe("Windows psmux runtime contract", () => {
+  beforeEach(() => {
+    // Clean up leftover dashboard snapshots from prior tests so nextId
+    // isn't bumped by stale data in the shared .omni-monitors directory.
+    try {
+      const { readdirSync } = require("node:fs") as typeof import("node:fs")
+      for (const f of readdirSync("D:/Omni-Opencode/.omni-monitors")) {
+        if (f.startsWith("parent-session-") && f.endsWith("-dashboard.json")) {
+          rmSync(`D:/Omni-Opencode/.omni-monitors/${f}`)
+        }
+      }
+    } catch {}
+  })
+
   it("selects the Windows psmux runtime on the primary win32 path", () => {
     const createWindowsPsmuxRuntime = vi.fn(() => createStubRuntime("pty"))
     const createTmuxRuntime = vi.fn(() => createStubRuntime("tmux"))
@@ -309,6 +435,29 @@ describe("Windows psmux runtime contract", () => {
     expect(job.monitor.attachCommand).toBe(`${MANAGED_BINARY_PATH} attach -t parent-session-bootstrap`)
   })
 
+  it("quotes the generated job script path when the workspace path contains spaces", async () => {
+    const workspace = await createTempWorkspace("windows psmux spaced workspace")
+    const runPsmuxCommand = vi.fn(async () => undefined)
+    const runPsmuxQuery = createDashboardQueryStub()
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runPsmuxCommand,
+      runPsmuxQuery,
+    })
+
+    await runtime.start({
+      backend: "claude-code",
+      command: 'claude --print "hello"',
+      monitorSessionId: "parent-session-space-path",
+    })
+
+    const commands = (runPsmuxQuery.mock.calls as unknown as Array<[string]>).map(([command]) => command)
+    expectCommandContaining(commands, 'powershell.exe -NoLogo -NoProfile -File "')
+  })
+
   it("creates the detached dashboard session with a dedicated dashboard process, not a shell", async () => {
     const runPsmuxCommand = vi.fn(async () => undefined)
     const runPsmuxQuery = createDashboardQueryStub()
@@ -443,9 +592,10 @@ describe("Windows psmux runtime contract", () => {
 
     expect(firstJob.monitor.attachCommand).toBe(`${MANAGED_BINARY_PATH} attach -t parent-session-reattach`)
     expect(detachedMonitor.attachCommand).toBe(`${MANAGED_BINARY_PATH} attach -t parent-session-detached`)
-    expect(hasSharedSession).toHaveBeenNthCalledWith(1, "parent-session-reattach")
-    expect(hasSharedSession).toHaveBeenNthCalledWith(2, "parent-session-detached")
-    expect(hasSharedSession).toHaveBeenCalledTimes(2)
+    // hasSharedSession is called on every ensureSharedSession: once for the first start (no cache),
+    // once for the second start (cache hit, liveness check), and once for openMonitor on a different session.
+    expect(hasSharedSession).toHaveBeenCalledWith("parent-session-reattach")
+    expect(hasSharedSession).toHaveBeenCalledWith("parent-session-detached")
     expect(runPsmuxCommand).not.toHaveBeenCalledWith(`${MANAGED_BINARY_PATH} start-server`)
     expect(runPsmuxCommand).not.toHaveBeenCalledWith(
       expect.stringContaining("new-session -d -s parent-session-detached"),
@@ -495,6 +645,7 @@ describe("Windows psmux runtime contract", () => {
       platform: "win32",
       cwd: "D:/Omni-Opencode",
       ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
       runPsmuxCommand,
       open,
       launchSharedSessionClient,
@@ -581,7 +732,8 @@ describe("Windows psmux runtime contract", () => {
     ).toHaveLength(2)
   })
 
-  it("configures background pipe-pane bookkeeping per delegated job without changing the visible attach contract", async () => {
+  it("writes per-job transcript scripts without changing the visible attach contract", async () => {
+    const cwd = await createTempWorkspace()
     const sharedClient = createMockPty()
     const runPsmuxCommand = vi.fn(async () => undefined)
     const runPsmuxQuery = vi.fn(async (command: string) => {
@@ -609,7 +761,7 @@ describe("Windows psmux runtime contract", () => {
 
     const runtime = createWindowsPsmuxRuntime({
       platform: "win32",
-      cwd: "D:/Omni-Opencode",
+      cwd,
       ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
       launchSharedSessionClient: vi.fn(async () => sharedClient),
       runPsmuxCommand,
@@ -635,15 +787,942 @@ describe("Windows psmux runtime contract", () => {
     expect(secondJob.monitor.attachCommand).toBe(`${MANAGED_BINARY_PATH} attach -t parent-session-1`)
     expect(firstJob.monitor.logTailCommand).toBeUndefined()
     expect(secondJob.monitor.logTailCommand).toBeUndefined()
-    expect(firstJob.monitor.transcriptCaptureTarget).toBe("D:/Omni-Opencode/.omni-monitors/runtime-1.log")
-    expect(secondJob.monitor.transcriptCaptureTarget).toBe("D:/Omni-Opencode/.omni-monitors/runtime-2.log")
+    expect(firstJob.monitor.transcriptCaptureTarget).toBe(`${cwd.replace(/\\/g, "/")}/.omni-monitors/parent-session-1-runtime-1.log`)
+    expect(secondJob.monitor.transcriptCaptureTarget).toBe(`${cwd.replace(/\\/g, "/")}/.omni-monitors/parent-session-1-runtime-2.log`)
     const commands = (runPsmuxCommand.mock.calls as unknown as Array<[string]>).map(([command]) => command)
-    expectCommandContaining(commands, `${MANAGED_BINARY_PATH} pipe-pane -t %31 -o --`)
-    expectCommandContaining(commands, "runtime-1.log")
-    expectCommandContaining(commands, `${MANAGED_BINARY_PATH} pipe-pane -t %41 -o --`)
-    expectCommandContaining(commands, "runtime-2.log")
+    expect(commands.filter((command) => command.includes("pipe-pane -t %31 -o --"))).toEqual([])
+    expect(commands.filter((command) => command.includes("pipe-pane -t %41 -o --"))).toEqual([])
     expect(commands.filter((command) => command.includes("join-pane"))).toEqual([])
     expect(runPsmuxQuery.mock.calls.map(([command]) => command).filter((command) => command.includes("break-pane"))).toEqual([])
+
+    const firstJobScript = await readFile(join(cwd, ".omni-monitors", "runtime-1.ps1"), "utf8")
+    const secondJobScript = await readFile(join(cwd, ".omni-monitors", "runtime-2.ps1"), "utf8")
+
+    expect(firstJobScript).toContain('claude --print "hello"')
+    expect(secondJobScript).toContain('codex exec "hello"')
+    expect(firstJobScript).toContain('Tee-Object -FilePath')
+    expect(secondJobScript).toContain('Tee-Object -FilePath')
+    expect(firstJobScript).toContain('parent-session-1-runtime-1.log')
+    expect(secondJobScript).toContain('parent-session-1-runtime-2.log')
+    expect(firstJobScript).toContain('__OMNI_OPENCODE_PSMUX_EXIT__')
+    expect(secondJobScript).toContain('__OMNI_OPENCODE_PSMUX_EXIT__')
+  })
+
+  it("launches each job window in the per-job cwd when provided", async () => {
+    const runtimeCwd = await createTempWorkspace()
+    const jobCwd = await createTempWorkspace()
+    const runPsmuxQuery = createDashboardQueryStub()
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: runtimeCwd,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery,
+    })
+
+    await runtime.start({
+      backend: "claude-code",
+      command: 'claude --print "hello"',
+      monitorSessionId: "parent-session-cwd",
+      cwd: jobCwd,
+    })
+
+    const newWindowCommand = runPsmuxQuery.mock.calls
+      .map(([command]) => command)
+      .find((command) => command.includes("new-window -P -F"))
+
+    expect(newWindowCommand).toContain(` -c ${jobCwd.replace(/\\/g, "/")}`)
+  })
+
+  it("launches delegated codex job windows through a stream-json renderer", async () => {
+    const runPsmuxCommand = vi.fn(async () => undefined)
+    const runPsmuxQuery = createDashboardQueryStub()
+    const runPsmuxArgQuery = vi.fn(async () => "1 %31")
+    const runShellCommand = vi.fn(async () => undefined)
+    const workspace = await createTempWorkspace()
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellCommand,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand,
+      runPsmuxQuery,
+      runPsmuxArgQuery,
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect the vault door",
+        promptFingerprint: "fingerprint-1",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-1:codex",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    expect(runPsmuxArgQuery).not.toHaveBeenCalled()
+    const jobScript = await readFile(join(workspace, ".omni-monitors", "runtime-1.ps1"), "utf8")
+    const rendererScript = await readFile(join(workspace, ".omni-monitors", "delegation-renderer.cjs"), "utf8")
+    const backendScript = await readFile(join(workspace, ".omni-monitors", "parent-session-direct-cli-runtime-1.backend.ps1"), "utf8")
+    expect(jobScript).toContain("delegation-renderer.cjs")
+    expect(jobScript).toContain("parent-session-direct-cli-runtime-1.backend.ps1")
+    expect(jobScript).toContain(`& 'C:/Program Files/nodejs/node.exe'`)
+    expect(rendererScript).toContain("const backendScriptPath = process.argv[5];")
+    expect(rendererScript).toContain("const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-File', backendScriptPath]")
+    expect(backendScript).toContain('& "C:/Program Files/nodejs/node.exe"')
+    expect(backendScript).toContain('codex.js" exec --json "inspect the vault door')
+  })
+
+  it("derives the codex backend script from a configured codex shim path", async () => {
+    const workspace = await createTempWorkspace()
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'C:/custom/npm/codex.cmd exec --color never "hello"',
+      commandArgs: ["C:/custom/npm/codex.cmd", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect the vault door",
+        promptFingerprint: "fingerprint-custom-codex-shim",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-custom-codex:codex",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const backendScript = await readFile(join(workspace, ".omni-monitors", "parent-session-direct-cli-runtime-1.backend.ps1"), "utf8")
+
+    expect(backendScript).toContain('"C:/custom/npm/node_modules/@openai/codex/bin/codex.js" exec --json')
+  })
+
+  it("falls back to launching the resolved Codex executable when npm-style codex.js resolution is unavailable", async () => {
+    const workspace = await createTempWorkspace()
+    const runShellQuery = vi.fn(async (command: string) => {
+      if (command.includes("Get-Command 'node'")) {
+        return "C:/Program Files/nodejs/node.exe"
+      }
+
+      if (command.includes("Get-Command 'codex'")) {
+        return "C:/portable/codex.exe"
+      }
+
+      if (command.includes("node_modules/@openai/codex/bin/codex.js")) {
+        throw new Error("Failed to resolve codex.js")
+      }
+
+      throw new Error(`Unexpected shell query: ${command}`)
+    })
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery,
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect the vault door",
+        promptFingerprint: "fingerprint-fallback-codex-exe",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-fallback-codex:codex",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const backendScript = await readFile(join(workspace, ".omni-monitors", "parent-session-direct-cli-runtime-1.backend.ps1"), "utf8")
+
+    expect(backendScript).toContain('& "C:/portable/codex.exe" exec --json "inspect the vault door')
+    expect(backendScript).not.toContain('node_modules/@openai/codex/bin/codex.js')
+  })
+
+  it("includes mapped Codex sandbox settings in delegated backend scripts", async () => {
+    const workspace = await createTempWorkspace()
+    const expectedCodexPolicy: ExpectedCodexPolicy = {
+      sandboxMode: "workspace-write",
+      writableRoots: [workspace],
+      networkAccess: false,
+      approvalPolicy: "never",
+    }
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect the vault door",
+        promptFingerprint: "fingerprint-codex-policy",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-codex-policy:codex",
+        codexPolicy: expectedCodexPolicy,
+      } as {
+        prompt: string
+        promptFingerprint: string
+        correlationMarker: string
+        codexPolicy: ExpectedCodexPolicy
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const backendScript = await readFile(join(workspace, ".omni-monitors", "parent-session-direct-cli-runtime-1.backend.ps1"), "utf8")
+    const codexConfigPath = join(workspace, ".omni-monitors", "parent-session-direct-cli-runtime-1.codex-config.json")
+    const codexConfig = JSON.parse(await readFile(codexConfigPath, "utf8")) as ExpectedCodexPolicy
+
+    expect(codexConfig).toEqual(expectedCodexPolicy)
+    expect(backendScript).toContain("parent-session-direct-cli-runtime-1.codex-config.json")
+    expect(backendScript).not.toContain(`--config \"${codexConfigPath.replace(/\\/g, "/")}\"`)
+    expect(backendScript).toContain("Get-Content")
+    expect(backendScript).toContain("ConvertFrom-Json")
+    expect(backendScript).toContain("$omniCodexArgs += '-c'")
+    expect(backendScript).toContain("sandbox_mode=")
+    expect(backendScript).toContain("approval_policy=")
+    expect(backendScript).toContain("--add-dir")
+  })
+
+  it("resolves delegated backend executables before renderer launch", async () => {
+    const runPsmuxCommand = vi.fn(async () => undefined)
+    const runPsmuxQuery = createDashboardQueryStub()
+    const runShellQuery = createBackendResolutionQueryStub()
+
+    const runtime = createWindowsPsmuxRuntime({
+      ...({ runShellQuery } as object),
+      platform: "win32",
+      cwd: "D:/Omni-Opencode",
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runPsmuxCommand,
+      runPsmuxQuery,
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect the vault door",
+        promptFingerprint: "fingerprint-resolved-codex",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-resolved:codex",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const jobScript = await readFile("D:/Omni-Opencode/.omni-monitors/runtime-1.ps1", "utf8")
+
+    expect(runShellQuery.mock.calls.map(([command]) => command)).toEqual(expect.arrayContaining([
+      expect.stringContaining("Get-Command 'node'"),
+      expect.stringContaining("Get-Command 'codex'"),
+    ]))
+    expect(jobScript).toContain("'C:/Program Files/nodejs/node.exe'")
+  })
+
+  it("launches delegated claude job windows through a stream-json renderer", async () => {
+    const runPsmuxCommand = vi.fn(async () => undefined)
+    const runPsmuxQuery = createDashboardQueryStub()
+    const runPsmuxArgQuery = vi.fn(async () => "1 %31")
+    const workspace = await createTempWorkspace()
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand,
+      runPsmuxQuery,
+      runPsmuxArgQuery,
+    })
+
+    await runtime.start({
+      backend: "claude-code",
+      command: 'claude --print "hello"',
+      commandArgs: ["claude", "--print", "hello"],
+      launchMetadata: {
+        claudePolicy: {
+          allowedTools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
+          disallowedTools: ["WebFetch", "WebSearch"],
+          permissionMode: "bypassPermissions",
+        },
+        prompt: "inspect the overseer terminal",
+        promptFingerprint: "fingerprint-claude-1",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-2:claude-code",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    expect(runPsmuxArgQuery).not.toHaveBeenCalled()
+    const jobScript = await readFile(join(workspace, ".omni-monitors", "runtime-1.ps1"), "utf8")
+    const rendererScript = await readFile(join(workspace, ".omni-monitors", "delegation-renderer.cjs"), "utf8")
+    const backendScript = await readFile(join(workspace, ".omni-monitors", "parent-session-direct-cli-runtime-1.backend.ps1"), "utf8")
+    expect(jobScript).toContain("delegation-renderer.cjs")
+    expect(jobScript).toContain("parent-session-direct-cli-runtime-1.backend.ps1")
+    expect(rendererScript).toContain("const backendScriptPath = process.argv[5];")
+    expect(rendererScript).toContain("const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-File', backendScriptPath]")
+    expect(rendererScript).toContain("const payload = record && typeof record.event === 'object' && record.event ? record.event : record;")
+    expect(rendererScript).toContain("delta && typeof delta.type === 'string' && delta.type === 'text_delta'")
+    expect(backendScript).toContain('& "C:/tools/claude.exe" -p "inspect the overseer terminal')
+    expect(backendScript).toContain('--output-format stream-json --verbose --include-partial-messages')
+    expect(backendScript).toContain("--permission-mode bypassPermissions")
+    expect(backendScript).toContain("--allowedTools Read,Glob,Grep,Edit,Write,Bash")
+    expect(backendScript).toContain("--disallowedTools WebFetch,WebSearch")
+  })
+
+  it("builds Claude backend scripts with mapped permission flags", () => {
+    const backendScript = buildClaudeBackendScriptWithPolicy(
+      "C:/tools/claude.exe",
+      "inspect the overseer terminal [marker: omni-opencode:parent-session-direct-cli:message-permissions:claude-code]",
+      {
+        allowedTools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
+        disallowedTools: ["WebFetch", "WebSearch"],
+        permissionMode: "bypassPermissions",
+      },
+    )
+
+    expect(backendScript).toContain("--permission-mode bypassPermissions")
+    expect(backendScript).toContain("--allowedTools Read,Glob,Grep,Edit,Write,Bash")
+    expect(backendScript).toContain("--disallowedTools WebFetch,WebSearch")
+  })
+
+  it("treats Codex stderr as backend progress noise without replacing stdout transcript content", async () => {
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect the vault door",
+        promptFingerprint: "fingerprint-codex-transcript",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-codex-transcript:codex",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const logDirectory = join(workspace, ".omni-monitors")
+    const rendererScriptPath = join(logDirectory, "delegation-renderer.cjs")
+    const backendScriptPath = join(logDirectory, "renderer-codex-fixture.backend.ps1")
+    const transcriptPath = join(logDirectory, "renderer-codex-fixture.log")
+    const streamPath = join(logDirectory, "renderer-codex-fixture.stream.log")
+
+    await writeFile(backendScriptPath, [
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "thread.message.delta", delta: "Final answer" })}')`,
+      `[Console]::Error.WriteLine('Reading additional input from stdin...')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "turn.completed" })}')`,
+    ].join("\n"), "utf8")
+
+    const result = await runNodeScript(rendererScriptPath, [
+      "codex",
+      transcriptPath,
+      streamPath,
+      backendScriptPath,
+    ])
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe("")
+
+    const transcript = await readFile(transcriptPath, "utf8")
+
+    expect(transcript).toContain("Final answer\n")
+    expect(transcript).toContain("[codex] progress: Reading additional input from stdin...\n")
+    expect(transcript).not.toContain("[codex] final result\n")
+    expect(transcript).not.toContain("[codex stderr]")
+  })
+
+  it("preserves markdown-like readability in the live Windows transcript renderer path", async () => {
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect transcript markdown formatting",
+        promptFingerprint: "fingerprint-codex-markdown-transcript",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-codex-markdown-transcript:codex",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const logDirectory = join(workspace, ".omni-monitors")
+    const rendererScriptPath = join(logDirectory, "delegation-renderer.cjs")
+    const backendScriptPath = join(logDirectory, "renderer-codex-markdown-fixture.backend.ps1")
+    const transcriptPath = join(logDirectory, "renderer-codex-markdown-fixture.log")
+    const streamPath = join(logDirectory, "renderer-codex-markdown-fixture.stream.log")
+
+    await writeFile(backendScriptPath, [
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "thread.message.delta", delta: "## Findings\n- Package name: `omni-opencode`" })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "turn.completed" })}')`,
+    ].join("\n"), "utf8")
+
+    const result = await runNodeScript(rendererScriptPath, [
+      "codex",
+      transcriptPath,
+      streamPath,
+      backendScriptPath,
+    ])
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe("")
+
+    const transcript = await readFile(transcriptPath, "utf8")
+
+    expect(transcript).toBe([
+      "\x1b[1m\x1b[36mFindings\x1b[0m",
+      "  • Package name: \x1b[36momni-opencode\x1b[0m",
+      "",
+    ].join("\n"))
+  })
+
+  it("renders Codex transcripts with retained progress and direct final output in the live Windows path", async () => {
+    const prompt = "inspect live cli transcript feel"
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt,
+        promptFingerprint: "fingerprint-codex-cli-like-transcript",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-codex-cli-like-transcript:codex",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const logDirectory = join(workspace, ".omni-monitors")
+    const rendererScriptPath = join(logDirectory, "delegation-renderer.cjs")
+    const backendScriptPath = join(logDirectory, "renderer-codex-cli-like-fixture.backend.ps1")
+    const transcriptPath = join(logDirectory, "renderer-codex-cli-like-fixture.log")
+    const streamPath = join(logDirectory, "renderer-codex-cli-like-fixture.stream.log")
+
+    await writeFile(backendScriptPath, [
+      `[Console]::Error.WriteLine('Inspecting package metadata')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "assistant.message.delta", delta: "Inspecting package metadata" })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "item.completed", item: { id: "item_0", type: "agent_message", text: "## Findings\n- Package name: `omni-opencode`" } })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "turn.completed" })}')`,
+    ].join("\n"), "utf8")
+
+    const result = await runNodeScript(rendererScriptPath, [
+      "codex",
+      transcriptPath,
+      streamPath,
+      backendScriptPath,
+      encodeDelegatedTranscriptHeader(prompt),
+    ])
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe("")
+
+    const transcript = await readFile(transcriptPath, "utf8")
+
+    expect(transcript).toBe([
+      ...buildExpectedDelegatedTranscriptHeader(prompt),
+      "[codex] progress: Inspecting package metadata",
+      "Inspecting package metadata",
+      "\x1b[1m\x1b[36mFindings\x1b[0m",
+      "  • Package name: \x1b[36momni-opencode\x1b[0m",
+      "",
+    ].join("\n"))
+    expect(transcript.indexOf("[omni-opencode] prompt\n")).toBe(0)
+    expect(transcript.match(/\[omni-opencode\] prompt/g)).toHaveLength(1)
+  })
+
+  it("renders Codex final text when it only arrives on turn.completed", async () => {
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect codex final turn text",
+        promptFingerprint: "fingerprint-codex-final-turn-text",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-codex-final-turn-text:codex",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const logDirectory = join(workspace, ".omni-monitors")
+    const rendererScriptPath = join(logDirectory, "delegation-renderer.cjs")
+    const backendScriptPath = join(logDirectory, "renderer-codex-final-turn-text.backend.ps1")
+    const transcriptPath = join(logDirectory, "renderer-codex-final-turn-text.log")
+    const streamPath = join(logDirectory, "renderer-codex-final-turn-text.stream.log")
+
+    await writeFile(backendScriptPath, [
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "turn.completed", text: "## Findings\n- Package name: `omni-opencode`" })}')`,
+    ].join("\n"), "utf8")
+
+    const result = await runNodeScript(rendererScriptPath, [
+      "codex",
+      transcriptPath,
+      streamPath,
+      backendScriptPath,
+    ])
+
+    expect(result.exitCode).toBe(0)
+    const transcript = await readFile(transcriptPath, "utf8")
+
+    expect(transcript).toBe([
+      "\x1b[1m\x1b[36mFindings\x1b[0m",
+      "  • Package name: \x1b[36momni-opencode\x1b[0m",
+      "",
+    ].join("\n"))
+  })
+
+  it("coalesces Claude text deltas and suppresses duplicate assistant or result snapshots in transcript output", async () => {
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "claude-code",
+      command: 'claude --print "hello"',
+      commandArgs: ["claude", "--print", "hello"],
+      launchMetadata: {
+        prompt: "inspect the overseer terminal",
+        promptFingerprint: "fingerprint-claude-transcript",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-claude-transcript:claude-code",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const logDirectory = join(workspace, ".omni-monitors")
+    const rendererScriptPath = join(logDirectory, "delegation-renderer.cjs")
+    const backendScriptPath = join(logDirectory, "renderer-claude-fixture.backend.ps1")
+    const transcriptPath = join(logDirectory, "renderer-claude-fixture.log")
+    const streamPath = join(logDirectory, "renderer-claude-fixture.stream.log")
+
+    await writeFile(backendScriptPath, [
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-1", role: "assistant", content: [] } } })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "PACKAGE: omni-opencode" } } })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "\nTITLE: Omni-Opencode" } } })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "PACKAGE: omni-opencode\nTITLE: Omni-Opencode" }] } })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null, stop_details: null } } })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "result", subtype: "success", result: "PACKAGE: omni-opencode\nTITLE: Omni-Opencode" })}')`,
+    ].join("\n"), "utf8")
+
+    const result = await runNodeScript(rendererScriptPath, [
+      "claude-code",
+      transcriptPath,
+      streamPath,
+      backendScriptPath,
+    ])
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe("")
+
+    const transcript = await readFile(transcriptPath, "utf8")
+
+    expect(transcript).toBe("PACKAGE: omni-opencode\nTITLE: Omni-Opencode\n")
+  })
+
+  it("waits for late Claude result text before writing the final result marker", async () => {
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "claude-code",
+      command: 'claude --print "hello"',
+      commandArgs: ["claude", "--print", "hello"],
+      launchMetadata: {
+        prompt: "inspect late claude result",
+        promptFingerprint: "fingerprint-claude-late-result",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-claude-late-result:claude-code",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const logDirectory = join(workspace, ".omni-monitors")
+    const rendererScriptPath = join(logDirectory, "delegation-renderer.cjs")
+    const backendScriptPath = join(logDirectory, "renderer-claude-late-result.backend.ps1")
+    const transcriptPath = join(logDirectory, "renderer-claude-late-result.log")
+    const streamPath = join(logDirectory, "renderer-claude-late-result.stream.log")
+
+    await writeFile(backendScriptPath, [
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-1", role: "assistant", content: [] } } })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null, stop_details: null } } })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "result", subtype: "success", result: "PACKAGE: omni-opencode\nTITLE: Omni-Opencode" })}')`,
+    ].join("\n"), "utf8")
+
+    const result = await runNodeScript(rendererScriptPath, [
+      "claude-code",
+      transcriptPath,
+      streamPath,
+      backendScriptPath,
+    ])
+
+    expect(result.exitCode).toBe(0)
+    const transcript = await readFile(transcriptPath, "utf8")
+
+    expect(transcript).toBe("PACKAGE: omni-opencode\nTITLE: Omni-Opencode\n")
+  })
+
+  it("renders summarized intermediate Claude tool activity without dumping raw tool payloads", async () => {
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "claude-code",
+      command: 'claude --print "hello"',
+      commandArgs: ["claude", "--print", "hello"],
+      launchMetadata: {
+        prompt: "inspect tool activity",
+        promptFingerprint: "fingerprint-claude-tool-summary",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-claude-tool-summary:claude-code",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const logDirectory = join(workspace, ".omni-monitors")
+    const rendererScriptPath = join(logDirectory, "delegation-renderer.cjs")
+    const backendScriptPath = join(logDirectory, "renderer-claude-tool-summary.backend.ps1")
+    const transcriptPath = join(logDirectory, "renderer-claude-tool-summary.log")
+    const streamPath = join(logDirectory, "renderer-claude-tool-summary.stream.log")
+
+    await writeFile(backendScriptPath, [
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "tool_use", id: "toolu_01", name: "Read", input: { file_path: "D:/Omni-Opencode/package.json" } })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "tool_result", tool_use_id: "toolu_01", is_error: true, content: [{ type: "text", text: "{\"name\":\"omni-opencode\"}" }] })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "result", subtype: "success", result: "## Findings\n- Package name: `omni-opencode`" })}')`,
+    ].join("\n"), "utf8")
+
+    const result = await runNodeScript(rendererScriptPath, [
+      "claude-code",
+      transcriptPath,
+      streamPath,
+      backendScriptPath,
+    ])
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe("")
+
+    const transcript = await readFile(transcriptPath, "utf8")
+
+    expect(transcript).toBe([
+      "[claude] tool_use: Read",
+      "[claude] tool_result: error",
+      "\x1b[1m\x1b[36mFindings\x1b[0m",
+      "  • Package name: \x1b[36momni-opencode\x1b[0m",
+      "",
+    ].join("\n"))
+    expect(transcript).not.toContain('{"name":"omni-opencode"}')
+  })
+
+  it("renders Claude transcripts with concise tool lines and direct assistant output in the live Windows path", async () => {
+    const prompt = "inspect claude cli transcript feel"
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "claude-code",
+      command: 'claude --print "hello"',
+      commandArgs: ["claude", "--print", "hello"],
+      launchMetadata: {
+        prompt,
+        promptFingerprint: "fingerprint-claude-cli-like-transcript",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-claude-cli-like-transcript:claude-code",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const logDirectory = join(workspace, ".omni-monitors")
+    const rendererScriptPath = join(logDirectory, "delegation-renderer.cjs")
+    const backendScriptPath = join(logDirectory, "renderer-claude-cli-like-fixture.backend.ps1")
+    const transcriptPath = join(logDirectory, "renderer-claude-cli-like-fixture.log")
+    const streamPath = join(logDirectory, "renderer-claude-cli-like-fixture.stream.log")
+
+    await writeFile(backendScriptPath, [
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "tool_use", id: "toolu_02", name: "Read", input: { file_path: "D:/Omni-Opencode/package.json" } })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "tool_result", tool_use_id: "toolu_02", content: [{ type: "text", text: "ok" }] })}')`,
+      `[Console]::Out.WriteLine('${JSON.stringify({ type: "result", subtype: "success", result: "## Findings\n- Package name: `omni-opencode`" })}')`,
+    ].join("\n"), "utf8")
+
+    const result = await runNodeScript(rendererScriptPath, [
+      "claude-code",
+      transcriptPath,
+      streamPath,
+      backendScriptPath,
+      encodeDelegatedTranscriptHeader(prompt),
+    ])
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe("")
+
+    const transcript = await readFile(transcriptPath, "utf8")
+
+    expect(transcript).toBe([
+      ...buildExpectedDelegatedTranscriptHeader(prompt),
+      "[claude] tool_use: Read",
+      "[claude] tool_result: ok",
+      "\x1b[1m\x1b[36mFindings\x1b[0m",
+      "  • Package name: \x1b[36momni-opencode\x1b[0m",
+      "",
+    ].join("\n"))
+    expect(transcript.indexOf("[omni-opencode] prompt\n")).toBe(0)
+    expect(transcript.match(/\[omni-opencode\] prompt/g)).toHaveLength(1)
+    expect(transcript).not.toContain('{"type":"tool_use"')
+    expect(transcript).not.toContain('[claude] final result')
+  })
+
+  it("flushes a final structured JSON line even when stdout ends without a trailing newline", async () => {
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect unterminated codex output",
+        promptFingerprint: "fingerprint-codex-unterminated-output",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-codex-unterminated:codex",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const logDirectory = join(workspace, ".omni-monitors")
+    const rendererScriptPath = join(logDirectory, "delegation-renderer.cjs")
+    const backendScriptPath = join(logDirectory, "renderer-codex-unterminated.backend.ps1")
+    const transcriptPath = join(logDirectory, "renderer-codex-unterminated.log")
+    const streamPath = join(logDirectory, "renderer-codex-unterminated.stream.log")
+
+    await writeFile(backendScriptPath, [
+      `[Console]::Out.Write('${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Final answer" } })}')`,
+    ].join("\n"), "utf8")
+
+    const result = await runNodeScript(rendererScriptPath, [
+      "codex",
+      transcriptPath,
+      streamPath,
+      backendScriptPath,
+    ])
+
+    expect(result.exitCode).toBe(0)
+    const transcript = await readFile(transcriptPath, "utf8")
+
+    expect(transcript).toBe("Final answer\n")
+  })
+
+  it("marks delegated jobs complete from structured stream completion events", async () => {
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    const job = await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt: "inspect the vault door",
+        promptFingerprint: "fingerprint-1",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-1:codex",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    await writeFile(job.monitor.transcriptCaptureTarget!, "renderer output\n", "utf8")
+    await writeFile(
+      job.monitor.structuredStreamCaptureTarget!,
+      `${JSON.stringify({ type: "thread.message.delta", delta: "renderer output" })}\n${JSON.stringify({ type: "turn.completed" })}\n`,
+      "utf8",
+    )
+
+    await expect(runtime.read(job.id)).resolves.toEqual({ data: "renderer output\n" })
+    const snapshot = await runtime.snapshot()
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: job.id, status: "stopped" }),
+    ]))
+  })
+
+  it("marks delegated renderer jobs complete from plain-text Claude output and NUL-padded exit markers", async () => {
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    const job = await runtime.start({
+      backend: "claude-code",
+      command: 'claude --print "hello"',
+      commandArgs: ["claude", "--print", "hello"],
+      launchMetadata: {
+        prompt: "inspect the overseer terminal",
+        promptFingerprint: "fingerprint-claude-raw-fallback",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-3:claude-code",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const jobScript = await readFile(join(workspace, ".omni-monitors", "runtime-1.ps1"), "utf8")
+    expect(jobScript).toContain('__OMNI_OPENCODE_PSMUX_EXIT__')
+
+    await writeFile(
+      job.monitor.transcriptCaptureTarget!,
+      `renderer output\n${"__OMNI_OPENCODE_PSMUX_EXIT__:0".split("").join("\0")}\n`,
+      "utf8",
+    )
+    await writeFile(
+      job.monitor.structuredStreamCaptureTarget!,
+      "Plain Claude text output\n",
+      "utf8",
+    )
+
+    await expect(runtime.read(job.id)).resolves.toEqual({ data: "renderer output\n" })
+    const snapshot = await runtime.snapshot()
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: job.id, status: "stopped" }),
+    ]))
+  })
+
+  it("keeps non-delegated commandArgs launches on the legacy script-backed wrapper path", async () => {
+    const workspace = await createTempWorkspace()
+    const runPsmuxCommand = vi.fn(async () => undefined)
+    const runPsmuxQuery = createDashboardQueryStub()
+    const runPsmuxArgQuery = vi.fn(async () => "1 %31")
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runPsmuxCommand,
+      runPsmuxQuery,
+      runPsmuxArgQuery,
+    })
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      monitorSessionId: "parent-session-legacy-command-args",
+    })
+
+    expect(runPsmuxArgQuery).not.toHaveBeenCalled()
+    const queryCommands = runPsmuxQuery.mock.calls.map(([command]) => command)
+    expectCommandContaining(
+      queryCommands,
+      `${MANAGED_BINARY_PATH} new-window -P -F "#{window_index} #{pane_id}" -t parent-session-legacy-command-args -n job-runtime-1 -d -- powershell.exe -NoLogo -NoProfile -File`,
+    )
+    expectCommandContaining(queryCommands, "runtime-1.ps1")
+    const commands = runPsmuxCommand.mock.calls.map(([command]) => command)
+    expect(commands.filter((command) => command.includes("send-keys -t %31"))).toEqual([])
+    const jobScript = await readFile(join(workspace, ".omni-monitors", "runtime-1.ps1"), "utf8")
+    expect(jobScript).toContain('codex exec --color never "hello"')
   })
 
   it("stores real psmux window identities per job while keeping the dashboard at window 0", async () => {
@@ -946,6 +2025,79 @@ describe("Windows psmux runtime contract", () => {
     expect(readTranscriptCaptureFile).toHaveBeenNthCalledWith(2, job.monitor.transcriptCaptureTarget, "line one\n".length)
   })
 
+  it("marks a job stopped during snapshot even if runtime.read already consumed the exit marker", async () => {
+    const readTranscriptCaptureFile = vi
+      .fn(async (_target: string, offset: number) => {
+        if (offset === 0) {
+          const data = "line one\n__OMNI_OPENCODE_PSMUX_EXIT__:0\n"
+          return { data, nextOffset: data.length }
+        }
+
+        return { data: "", nextOffset: offset }
+      })
+    const runPsmuxQuery = createDashboardQueryStub()
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: "D:/Omni-Opencode",
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      launchSharedSessionClient: vi.fn(async () => createMockPty()),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      readTranscriptCaptureFile,
+      runPsmuxQuery,
+    })
+
+    const job = await runtime.start({
+      backend: "codex",
+      command: 'codex exec "hello"',
+      monitorSessionId: "parent-session-1",
+    })
+
+    await expect(runtime.read(job.id)).resolves.toEqual({ data: "line one\n" })
+    const snapshot = await runtime.snapshot()
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: job.id, status: "stopped" }),
+    ]))
+  })
+
+  it("parses inline exit markers after transcript output without a trailing newline", async () => {
+    const readTranscriptCaptureFile = vi
+      .fn(async (_target: string, offset: number) => {
+        if (offset === 0) {
+          const data = "final line without newline__OMNI_OPENCODE_PSMUX_EXIT__:0\n"
+          return { data, nextOffset: data.length }
+        }
+
+        return { data: "", nextOffset: offset }
+      })
+    const runPsmuxQuery = createDashboardQueryStub()
+
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: "D:/Omni-Opencode",
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      launchSharedSessionClient: vi.fn(async () => createMockPty()),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      readTranscriptCaptureFile,
+      runPsmuxQuery,
+    })
+
+    const job = await runtime.start({
+      backend: "codex",
+      command: 'codex exec "hello"',
+      monitorSessionId: "parent-session-inline-exit-marker",
+    })
+
+    await expect(runtime.read(job.id)).resolves.toEqual({ data: "final line without newline\n" })
+
+    const snapshot = await runtime.snapshot()
+
+    expect(snapshot.jobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: job.id, status: "stopped" }),
+    ]))
+  })
+
   it("unregisters naturally completed shared-session jobs so the last explicit stop can clean up the session", async () => {
     const runPsmuxCommand = vi.fn(async () => undefined)
     const readTranscriptCaptureFile = vi.fn(async (target: string, offset: number) => {
@@ -966,6 +2118,7 @@ describe("Windows psmux runtime contract", () => {
       platform: "win32",
       cwd: "D:/Omni-Opencode",
       ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
       launchSharedSessionClient: vi.fn(async () => createMockPty()),
       runPsmuxCommand,
       readTranscriptCaptureFile,
@@ -1127,12 +2280,9 @@ describe("Windows psmux runtime contract", () => {
 
     expect(job.monitor.attachCommand).toBe(`${MANAGED_BINARY_PATH} attach -t parent-session-old-layout`)
     expect(hasSharedSession).toHaveBeenCalledTimes(1)
-    expect(runPsmuxCommand).toHaveBeenCalledWith(`${MANAGED_BINARY_PATH} kill-session -t parent-session-old-layout`)
-    expect(runPsmuxCommand).toHaveBeenCalledWith(`${MANAGED_BINARY_PATH} start-server`)
-    expectCommandContaining(
-      runPsmuxCommand.mock.calls.map(([command]) => command),
-      `${MANAGED_BINARY_PATH} new-session -d -s parent-session-old-layout -n dashboard -- node --dashboard-process`,
-    )
+    // Old layout (1 pane) triggers a repair: split-window adds the missing pane
+    // without killing the session, preserving old job windows.
+    expect(runPsmuxCommand).not.toHaveBeenCalledWith(`${MANAGED_BINARY_PATH} kill-session -t parent-session-old-layout`)
     expect(runPsmuxCommand).toHaveBeenCalledWith(
       `${MANAGED_BINARY_PATH} split-window -t parent-session-old-layout:dashboard -h -p 35 -d -- powershell.exe -NoLogo -NoProfile`,
     )
@@ -1227,7 +2377,10 @@ describe("Windows psmux runtime contract", () => {
 
     expect(respawnCommands).toHaveLength(1)
     expect(respawnCommands[0]).toContain("respawn-pane -k -t %11")
-    expect(respawnCommands[0]).toContain("node --dashboard-process")
+    // Dashboard command is sent via send-keys after respawn (psmux ignores -- <cmd> on respawn-pane)
+    const sendKeysCommands = commands.filter((command) => command.includes("send-keys -t %11"))
+    expect(sendKeysCommands.length).toBeGreaterThanOrEqual(1)
+    expect(sendKeysCommands.some((c) => c.includes("node"))).toBe(true)
     expect(commands.filter((command) => command.includes("kill-session"))).toEqual([])
     expect(commands.filter((command) => command.includes("kill-window -t parent-session-respawn:dashboard"))).toEqual([])
   })
@@ -1318,67 +2471,4 @@ describe("Windows psmux runtime contract", () => {
     expect(runPsmuxCommand).not.toHaveBeenCalledWith(expect.stringContaining("new-session -d -s parent-session-live-cache"))
   })
 
-  it("persists the per-job transcript capture target through the stored job metadata path", async () => {
-    const sharedClient = createMockPty()
-    const runPsmuxQuery = createDashboardQueryStub()
-    const runtime = createWindowsPsmuxRuntime({
-      platform: "win32",
-      cwd: "D:/Omni-Opencode",
-      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
-      launchSharedSessionClient: vi.fn(async () => sharedClient),
-      runPsmuxCommand: vi.fn(async () => undefined),
-      runPsmuxQuery,
-    })
-    const store = createJobStore()
-
-    const firstJob = await runtime.start({
-      backend: "claude-code",
-      command: 'claude --print "hello"',
-      monitorSessionId: "parent-session-1",
-    })
-    const secondJob = await runtime.start({
-      backend: "codex",
-      command: 'codex exec "hello"',
-      monitorSessionId: "parent-session-1",
-    })
-
-    await store.save(createStoredJobRecord(
-      "batch-1",
-      "parent-session-1",
-      "message-1",
-      "windows-psmux",
-      firstJob,
-      firstJob.monitor,
-      "running",
-      true,
-      true,
-    ))
-    await store.save(createStoredJobRecord(
-      "batch-1",
-      "parent-session-1",
-      "message-1",
-      "windows-psmux",
-      secondJob,
-      secondJob.monitor,
-      "running",
-      true,
-      true,
-    ))
-
-    const storedFirstJob = await store.get(`parent-session-1:${firstJob.id}`)
-    const storedSecondJob = await store.get(`parent-session-1:${secondJob.id}`)
-
-    expect(storedFirstJob).toMatchObject({
-      attachTarget: "parent-session-1:1",
-      terminalLogPath: "D:/Omni-Opencode/.omni-monitors/runtime-1.log",
-      logTailCommand: undefined,
-      transcriptCaptureTarget: "D:/Omni-Opencode/.omni-monitors/runtime-1.log",
-    })
-    expect(storedSecondJob).toMatchObject({
-      attachTarget: "parent-session-1:1",
-      terminalLogPath: "D:/Omni-Opencode/.omni-monitors/runtime-2.log",
-      logTailCommand: undefined,
-      transcriptCaptureTarget: "D:/Omni-Opencode/.omni-monitors/runtime-2.log",
-    })
-  })
 })
