@@ -3,6 +3,7 @@ import { mapClaudeMessage, createClaudeAdapter } from "../src/adapters/claude-ad
 import type { ClaudeSDKMessage, ClaudeClient, ClaudeSDKPolicy } from "../src/adapters/claude-client.js"
 import type { DelegationCapabilities } from "../src/core/delegation-permissions.js"
 import * as policyMappers from "../src/adapters/policy-mappers.js"
+import { loadDelegationPlugin, makeContext } from "./helpers/delegation-plugin-fixture.js"
 
 // ---------------------------------------------------------------------------
 // Mock client helper
@@ -365,5 +366,80 @@ describe("createClaudeAdapter", () => {
       cwd: undefined,
       policy,
     }])
+  })
+
+  it("launches Claude with read-only tools from the authoritative envelope", async () => {
+    const { plugin, runtime } = await loadDelegationPlugin({
+      stateName: "claude-authoritative-readonly",
+    })
+    const context = makeContext("parent-session-claude-readonly", "message-1", {
+      permissions: {
+        edit: "allow",
+        bash: "allow",
+        webfetch: "allow",
+      },
+      authoritativeDelegationPermissions: {
+        permissions: {
+          edit: "deny",
+          bash: "deny",
+          webfetch: "deny",
+          task: "deny",
+        },
+        externalDirectories: ["D:/Omni-Opencode/.worktrees/authoritative-readonly"],
+      },
+    })
+
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "inspect src/plugin.ts" },
+      context as never,
+    )
+
+    expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
+      backend: "claude-code",
+      launchMetadata: expect.objectContaining({
+        claudePolicy: expect.objectContaining({
+          permissionMode: "bypassPermissions",
+          allowedTools: expect.arrayContaining(["Read", "Glob", "Grep"]),
+          disallowedTools: expect.arrayContaining(["WebFetch", "WebSearch"]),
+        }),
+      }),
+    }))
+  })
+
+  it("launches Claude with write and shell tools from the authoritative envelope", async () => {
+    const { plugin, runtime } = await loadDelegationPlugin({
+      stateName: "claude-authoritative-write-shell",
+    })
+    const context = makeContext("parent-session-claude-write-shell", "message-1", {
+      permissions: {
+        edit: "deny",
+        bash: "deny",
+      },
+      authoritativeDelegationPermissions: {
+        permissions: {
+          edit: "allow",
+          bash: "allow",
+          webfetch: "deny",
+          task: "deny",
+        },
+        externalDirectories: ["D:/Omni-Opencode/.worktrees/pty-monitor"],
+      },
+    })
+
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "edit src/plugin.ts and run npm test" },
+      context as never,
+    )
+
+    expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
+      backend: "claude-code",
+      launchMetadata: expect.objectContaining({
+        claudePolicy: expect.objectContaining({
+          permissionMode: "bypassPermissions",
+          allowedTools: expect.arrayContaining(["Edit", "Write", "Bash"]),
+          disallowedTools: expect.arrayContaining(["WebFetch", "WebSearch"]),
+        }),
+      }),
+    }))
   })
 })

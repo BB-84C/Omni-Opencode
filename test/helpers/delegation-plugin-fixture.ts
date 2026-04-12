@@ -1,26 +1,89 @@
 import { vi } from "vitest"
 
+type MockToolPermissionDecision = "allow" | "ask" | "deny"
+
+type MockDelegationContextPermissions = {
+  edit: MockToolPermissionDecision
+  bash: MockToolPermissionDecision
+  webfetch: MockToolPermissionDecision
+  task: MockToolPermissionDecision
+}
+
+type MockAgentPermissionConfig = {
+  edit?: MockToolPermissionDecision
+  bash?: MockToolPermissionDecision | Record<string, MockToolPermissionDecision>
+  webfetch?: MockToolPermissionDecision
+  doom_loop?: MockToolPermissionDecision
+  external_directory?: MockToolPermissionDecision
+}
+
+type MockClientAgent = {
+  name: string
+  description?: string
+  mode?: "subagent" | "primary" | "all"
+  builtIn?: boolean
+  permission: MockAgentPermissionConfig
+  tools?: Record<string, boolean>
+  options?: Record<string, unknown>
+}
+
+type MakeContextOptions = {
+  agent?: string
+  permissions?: Partial<MockDelegationContextPermissions>
+  omitAuthoritativeDelegationPermissions?: boolean
+  authoritativeDelegationPermissions?: {
+    permissions: MockDelegationContextPermissions
+    externalDirectories?: string[]
+  } | null
+}
+
+function makeMockClientAgent(name: string, permission: MockAgentPermissionConfig): MockClientAgent {
+  return {
+    name,
+    mode: "all",
+    builtIn: true,
+    permission,
+    tools: {},
+    options: {},
+  }
+}
+
 function uniqueStateDir(name: string): string {
   return `D:/Omni-Opencode/.worktrees/pty-monitor/.tmp/${name}-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
-export function makeContext(sessionID: string, messageID = "message-1") {
-  return {
+export function makeContext(sessionID: string, messageID = "message-1", options: MakeContextOptions = {}) {
+  const permissions: MockDelegationContextPermissions = {
+    edit: "allow",
+    bash: "allow",
+    webfetch: "deny",
+    task: "deny",
+    ...options.permissions,
+  }
+  const authoritativeDelegationPermissions = options.authoritativeDelegationPermissions === undefined
+    ? { permissions }
+    : options.authoritativeDelegationPermissions
+
+  const context = {
     sessionID,
     messageID,
-    agent: "test-agent",
-    permissions: {
-      edit: "allow",
-      bash: "allow",
-      webfetch: "deny",
-      task: "deny",
-    },
+    agent: options.agent ?? "test-agent",
+    permissions,
     directory: "D:/Omni-Opencode/.worktrees/pty-monitor",
     worktree: "D:/Omni-Opencode/.worktrees/pty-monitor",
     abort: new AbortController().signal,
     metadata: vi.fn(),
     ask: vi.fn(),
   }
+
+  if (!options.omitAuthoritativeDelegationPermissions) {
+    return {
+      ...context,
+      authoritativeDelegationPermissions,
+    }
+  }
+
+  return context
 }
 
 type Backend = "claude-code" | "codex"
@@ -46,10 +109,24 @@ type LoadDelegationPluginOptions = {
   includeMessageCreate?: boolean
   stateName: string
   nextJobId?: (backend: Backend, launchCount: number) => string
+  agents?: MockClientAgent[]
+  agentsByName?: Record<string, MockAgentPermissionConfig>
+  agentsError?: Error
 }
 
 export async function loadDelegationPlugin(options: LoadDelegationPluginOptions) {
   vi.resetModules()
+  vi.doUnmock("../../src/core/delegation-permissions.js")
+
+  const includeAppAgents = options.agents !== undefined
+    || options.agentsByName !== undefined
+    || options.agentsError !== undefined
+  const agents = options.agents ?? Object.entries(options.agentsByName ?? {}).map(([name, permission]) => makeMockClientAgent(name, permission))
+  const clientAppAgents = includeAppAgents
+    ? (options.agentsError
+        ? vi.fn().mockRejectedValue(options.agentsError)
+        : vi.fn().mockResolvedValue(agents))
+    : undefined
 
   let launchCount = 0
   const nextJobId = options.nextJobId ?? ((backend: Backend) => backend === "claude-code" ? "claude-job-1" : "codex-job-1")
@@ -107,6 +184,11 @@ export async function loadDelegationPlugin(options: LoadDelegationPluginOptions)
 
   const { OmniOpencodePlugin } = await import("../../src/plugin.js")
   const client = {
+    ...(clientAppAgents ? {
+      app: {
+        agents: clientAppAgents,
+      },
+    } : {}),
     session: {
       create: vi.fn(),
       promptAsync: vi.fn().mockResolvedValue(undefined),

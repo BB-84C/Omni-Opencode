@@ -10,13 +10,24 @@ function makeContext(
   sessionID: string,
   permissions?: Partial<Record<"edit" | "bash" | "webfetch" | "task", "allow" | "ask" | "deny">>,
 ) {
+  const resolvedPermissions = {
+    edit: "allow",
+    bash: "allow",
+    webfetch: "deny",
+    task: "deny",
+    ...permissions,
+  } satisfies Record<"edit" | "bash" | "webfetch" | "task", "allow" | "ask" | "deny">
+
   return {
     sessionID,
     messageID: "message-1",
     agent: "test-agent",
     directory: "D:/Omni-Opencode/.worktrees/pty-monitor",
     worktree: "D:/Omni-Opencode/.worktrees/pty-monitor",
-    permissions,
+    permissions: resolvedPermissions,
+    authoritativeDelegationPermissions: {
+      permissions: resolvedPermissions,
+    },
     abort: new AbortController().signal,
     metadata: vi.fn(),
     ask: vi.fn(),

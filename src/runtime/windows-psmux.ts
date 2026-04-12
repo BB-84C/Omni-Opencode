@@ -1490,13 +1490,21 @@ function buildWindowsPsmuxCodexBackendScript(
     ? `& "${escapeWindowsPsmuxDoubleQuotedString(command.nodeCommand)}" "${escapeWindowsPsmuxDoubleQuotedString(command.codexScriptPath)}"`
     : `& "${escapeWindowsPsmuxDoubleQuotedString(command.backendCommand)}"`
 
+  const encodedPrompt = Buffer.from(promptText, "utf8").toString("base64")
+
   if (!configPath) {
-    return `${invocation} exec --json "${escapeWindowsPsmuxDoubleQuotedString(promptText)}"\n`
+    return [
+      `$omniPrompt = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${escapeWindowsPsmuxPowerShellString(encodedPrompt)}'))`,
+      `$omniCodexArgs = @('exec', '--json', '-')`,
+      `$omniPrompt | ${invocation} @omniCodexArgs`,
+      "",
+    ].join("\n")
   }
 
   return [
     `$omniCodexPolicy = Get-Content -Raw '${escapeWindowsPsmuxPowerShellString(configPath)}' | ConvertFrom-Json`,
-    "$omniCodexArgs = @('exec', '--json')",
+    `$omniPrompt = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${escapeWindowsPsmuxPowerShellString(encodedPrompt)}'))`,
+    "$omniCodexArgs = @('exec', '--json', '-')",
     "$omniCodexArgs += '-c'",
     "$omniCodexArgs += ('sandbox_mode=\"' + [string]$omniCodexPolicy.sandboxMode + '\"')",
     "$omniCodexArgs += '-c'",
@@ -1509,14 +1517,8 @@ function buildWindowsPsmuxCodexBackendScript(
     "    $omniCodexArgs += '--add-dir'",
     "    $omniCodexArgs += [string]$omniRoot",
     "  }",
-    "  if ($omniWritableRoots.Count -gt 0) {",
-    "    $omniTomlRoots = @($omniWritableRoots | ForEach-Object { '\"' + ([string]$_).Replace('\\', '/') + '\"' }) -join ','",
-    "    $omniCodexArgs += '-c'",
-    "    $omniCodexArgs += ('sandbox_workspace_write.writable_roots=[' + $omniTomlRoots + ']')",
-    "  }",
     "}",
-    `$omniCodexArgs += '${escapeWindowsPsmuxPowerShellString(promptText)}'`,
-    `${invocation} @omniCodexArgs`,
+    `$omniPrompt | ${invocation} @omniCodexArgs`,
     "",
   ].join("\n")
 }

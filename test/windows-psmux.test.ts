@@ -878,7 +878,10 @@ describe("Windows psmux runtime contract", () => {
     expect(rendererScript).toContain("const backendScriptPath = process.argv[5];")
     expect(rendererScript).toContain("const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-File', backendScriptPath]")
     expect(backendScript).toContain('& "C:/Program Files/nodejs/node.exe"')
-    expect(backendScript).toContain('codex.js" exec --json "inspect the vault door')
+    expect(backendScript).toContain('FromBase64String')
+    expect(backendScript).toContain('$omniPrompt')
+    expect(backendScript).toContain("$omniCodexArgs = @('exec', '--json', '-')")
+    expect(backendScript).toContain('$omniPrompt | & "C:/Program Files/nodejs/node.exe" "C:/tools/node_modules/@openai/codex/bin/codex.js" @omniCodexArgs')
   })
 
   it("derives the codex backend script from a configured codex shim path", async () => {
@@ -908,7 +911,8 @@ describe("Windows psmux runtime contract", () => {
 
     const backendScript = await readFile(join(workspace, ".omni-monitors", "parent-session-direct-cli-runtime-1.backend.ps1"), "utf8")
 
-    expect(backendScript).toContain('"C:/custom/npm/node_modules/@openai/codex/bin/codex.js" exec --json')
+    expect(backendScript).toContain('FromBase64String')
+    expect(backendScript).toContain('$omniPrompt | & "C:/Program Files/nodejs/node.exe" "C:/custom/npm/node_modules/@openai/codex/bin/codex.js" @omniCodexArgs')
   })
 
   it("falls back to launching the resolved Codex executable when npm-style codex.js resolution is unavailable", async () => {
@@ -953,7 +957,9 @@ describe("Windows psmux runtime contract", () => {
 
     const backendScript = await readFile(join(workspace, ".omni-monitors", "parent-session-direct-cli-runtime-1.backend.ps1"), "utf8")
 
-    expect(backendScript).toContain('& "C:/portable/codex.exe" exec --json "inspect the vault door')
+    expect(backendScript).toContain('FromBase64String')
+    expect(backendScript).toContain("$omniCodexArgs = @('exec', '--json', '-')")
+    expect(backendScript).toContain('$omniPrompt | & "C:/portable/codex.exe" @omniCodexArgs')
     expect(backendScript).not.toContain('node_modules/@openai/codex/bin/codex.js')
   })
 
@@ -1007,6 +1013,49 @@ describe("Windows psmux runtime contract", () => {
     expect(backendScript).toContain("sandbox_mode=")
     expect(backendScript).toContain("approval_policy=")
     expect(backendScript).toContain("--add-dir")
+    expect(backendScript).not.toContain("sandbox_workspace_write.writable_roots=")
+  })
+
+  it("encodes multiline Codex prompts safely in delegated backend scripts", async () => {
+    const workspace = await createTempWorkspace()
+    const runtime = createWindowsPsmuxRuntime({
+      platform: "win32",
+      cwd: workspace,
+      ensureManagedPsmuxInstalled: async () => createManagedInstallResult(),
+      hasSharedSession: async () => false,
+      runShellQuery: createBackendResolutionQueryStub(),
+      runPsmuxCommand: vi.fn(async () => undefined),
+      runPsmuxQuery: createDashboardQueryStub(),
+    })
+
+    const prompt = [
+      "In the current workspace, update or create `hi.md` so its full content is exactly:",
+      "",
+      ' Hi "Codex\\',
+      "",
+      "Make only that requested change.",
+    ].join("\n")
+
+    await runtime.start({
+      backend: "codex",
+      command: 'codex exec --color never "hello"',
+      commandArgs: ["codex", "exec", "--color", "never", "hello"],
+      launchMetadata: {
+        prompt,
+        promptFingerprint: "fingerprint-codex-multiline-prompt",
+        correlationMarker: "omni-opencode:parent-session-direct-cli:message-codex-multiline:codex",
+      },
+      monitorSessionId: "parent-session-direct-cli",
+    })
+
+    const backendScript = await readFile(join(workspace, ".omni-monitors", "parent-session-direct-cli-runtime-1.backend.ps1"), "utf8")
+
+    expect(backendScript).toContain("FromBase64String")
+    expect(backendScript).toContain("$omniPrompt")
+    expect(backendScript).toContain("@('exec', '--json', '-')")
+    expect(backendScript).toContain("$omniPrompt | &")
+    expect(backendScript).not.toContain(prompt)
+    expect(backendScript).not.toContain("$omniCodexArgs += 'In the current workspace")
   })
 
   it("resolves delegated backend executables before renderer launch", async () => {

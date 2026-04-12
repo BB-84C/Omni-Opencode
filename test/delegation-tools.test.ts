@@ -217,6 +217,8 @@ async function loadPluginWithoutMessageCreate() {
   })
 }
 
+const REAL_AUTHORITY_TEST_PROMPT = "delegate this task"
+
 async function loadWindowsPsmuxPlugin() {
   vi.resetModules()
 
@@ -749,7 +751,7 @@ describe("parent-facing delegation tools", () => {
     }))
   })
 
-  it("assigns the safe permission profile to review-style delegations without prompting the user", async () => {
+  it("records the active capability envelope for review-style delegations without prompting the user", async () => {
     const { plugin } = await loadPlugin()
     const context = makeContext("parent-session-safe")
 
@@ -765,12 +767,12 @@ describe("parent-facing delegation tools", () => {
       context as never,
     )
 
-    expect(snapshot).toContain('"taskClass": "review"')
-    expect(snapshot).toContain('"permissionProfile": "safe"')
+    expect(snapshot).toContain('"taskClass": "workspace-write"')
+    expect(snapshot).toContain('"permissionProfile": "dangerous"')
     expect(snapshot).toContain('"approvalMode": "not-required"')
   })
 
-  it("keeps review and investigation prompts safe even when they mention risky commands as subject matter", async () => {
+  it("keeps metadata tied to the active capability envelope even when prompts are review-oriented", async () => {
     const { plugin, runtime } = await loadPlugin()
 
     const reviewContext = makeContext("parent-session-review-subject", "message-1")
@@ -798,9 +800,9 @@ describe("parent-facing delegation tools", () => {
       summaryContext as never,
     )
 
-    expect(firstSnapshot).toContain('"permissionProfile": "safe"')
+    expect(firstSnapshot).toContain('"permissionProfile": "dangerous"')
     expect(firstSnapshot).toContain('"approvalMode": "not-required"')
-    expect(secondSnapshot).toContain('"permissionProfile": "safe"')
+    expect(secondSnapshot).toContain('"permissionProfile": "dangerous"')
     expect(secondSnapshot).toContain('"approvalMode": "not-required"')
   })
 
@@ -845,7 +847,7 @@ describe("parent-facing delegation tools", () => {
     }))
   })
 
-  it("still prompts for unresolved delegated capabilities when task classification is safe", async () => {
+  it("records capability-derived metadata after approving a write-capable launch", async () => {
     const directory = uniqueStateDir("delegation-safe-envelope-ask")
     const { plugin, runtime } = await loadPluginWithMockedDelegationEnvelope(directory, {
       capabilities: {
@@ -873,7 +875,8 @@ describe("parent-facing delegation tools", () => {
       context as never,
     )
 
-    expect(snapshot).toContain('"permissionProfile": "safe"')
+    expect(snapshot).toContain('"taskClass": "workspace-write"')
+    expect(snapshot).toContain('"permissionProfile": "dangerous"')
     expect(snapshot).toContain('"approvalMode": "once"')
   })
 
@@ -1001,6 +1004,15 @@ describe("parent-facing delegation tools", () => {
       messageID: "message-1",
       agent: "codex:gpt-5.4",
       permissions: {},
+      authoritativeDelegationPermissions: {
+        permissions: {
+          edit: "deny",
+          bash: "deny",
+          webfetch: "deny",
+          task: "deny",
+        },
+        externalDirectories: [],
+      },
       abort: new AbortController().signal,
       metadata: vi.fn(),
       ask: vi.fn(),
@@ -1015,6 +1027,123 @@ describe("parent-facing delegation tools", () => {
       backend: "codex",
       cwd: undefined,
     }))
+  })
+
+  it("uses the current build agent permissions from client.app.agents() when authoritative delegation permissions are absent", async () => {
+    const { plugin, runtime, client } = await loadDelegationPlugin({
+      stateName: "delegation-build-agent-permissions",
+      agentsByName: {
+        build: {
+          edit: "allow",
+          bash: { "*": "allow" },
+          webfetch: "allow",
+        },
+      },
+    })
+    const context = makeContext("parent-session-build-agent", "message-1", {
+      agent: "build",
+      permissions: {
+        edit: "deny",
+        bash: "deny",
+        webfetch: "deny",
+      },
+      omitAuthoritativeDelegationPermissions: true,
+    })
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: REAL_AUTHORITY_TEST_PROMPT },
+      context as never,
+    )
+
+    expect(client.app.agents).toHaveBeenCalledTimes(1)
+    expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
+      launchMetadata: expect.objectContaining({
+        codexPolicy: expect.objectContaining({
+          sandboxMode: "workspace-write",
+          networkAccess: true,
+        }),
+      }),
+    }))
+  })
+
+  it("uses the current plan agent permissions from client.app.agents() when authoritative delegation permissions are absent", async () => {
+    const { plugin, runtime, client } = await loadDelegationPlugin({
+      stateName: "delegation-plan-agent-permissions",
+      agentsByName: {
+        plan: {
+          edit: "deny",
+          bash: { "*": "deny" },
+          webfetch: "allow",
+        },
+      },
+    })
+    const context = makeContext("parent-session-plan-agent", "message-1", {
+      agent: "plan",
+      permissions: {
+        edit: "allow",
+        bash: "allow",
+        webfetch: "allow",
+      },
+      omitAuthoritativeDelegationPermissions: true,
+    })
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: REAL_AUTHORITY_TEST_PROMPT },
+      context as never,
+    )
+
+    expect(client.app.agents).toHaveBeenCalledTimes(1)
+    expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
+      launchMetadata: expect.objectContaining({
+        codexPolicy: expect.objectContaining({
+          sandboxMode: "read-only",
+          networkAccess: true,
+        }),
+      }),
+    }))
+  })
+
+  it("fails closed when client.app.agents() does not return the current agent", async () => {
+    const { plugin, runtime, client } = await loadDelegationPlugin({
+      stateName: "delegation-missing-current-agent",
+      agentsByName: {
+        build: {
+          edit: "allow",
+          bash: { "*": "allow" },
+        },
+      },
+    })
+    const context = makeContext("parent-session-missing-agent", "message-1", {
+      agent: "plan",
+      omitAuthoritativeDelegationPermissions: true,
+    })
+
+    await expect(plugin.tool!.delegate_to_codex.execute(
+      { prompt: REAL_AUTHORITY_TEST_PROMPT },
+      context as never,
+    )).rejects.toThrow(/agent permission|current agent/i)
+
+    expect(client.app.agents).toHaveBeenCalledTimes(1)
+    expect(runtime.start).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when client.app.agents() cannot be used", async () => {
+    const { plugin, runtime, client } = await loadDelegationPlugin({
+      stateName: "delegation-agent-list-error",
+      agentsError: new Error("agents unavailable"),
+    })
+    const context = makeContext("parent-session-agent-error", "message-1", {
+      agent: "build",
+      omitAuthoritativeDelegationPermissions: true,
+    })
+
+    await expect(plugin.tool!.delegate_to_codex.execute(
+      { prompt: REAL_AUTHORITY_TEST_PROMPT },
+      context as never,
+    )).rejects.toThrow(/agent permission|agents unavailable/i)
+
+    expect(client.app.agents).toHaveBeenCalledTimes(1)
+    expect(runtime.start).not.toHaveBeenCalled()
   })
 
   it("does not let a stored allow-session grant re-escalate a capability after it downgrades to deny", async () => {
@@ -1066,6 +1195,69 @@ describe("parent-facing delegation tools", () => {
           sandboxMode: "read-only",
         }),
       }),
+    }))
+  })
+
+  it("reuses allow-session grants when the authoritative ask envelope stays the same despite legacy permission mismatches", async () => {
+    const { plugin, runtime } = await loadPlugin()
+    const firstContext = makeContext("parent-session-authoritative-grant-reuse", "message-1", {
+      permissions: {
+        edit: "allow",
+        bash: "deny",
+      },
+      authoritativeDelegationPermissions: {
+        permissions: {
+          edit: "ask",
+          bash: "allow",
+          webfetch: "deny",
+          task: "deny",
+        },
+        externalDirectories: ["D:/Omni-Opencode/.worktrees/pty-monitor"],
+      },
+    })
+    firstContext.agent = "codex:gpt-5.4"
+    vi.mocked(firstContext.ask).mockResolvedValue("allow-session")
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "edit src/plugin.ts" },
+      firstContext as never,
+    )
+
+    const secondContext = makeContext("parent-session-authoritative-grant-reuse", "message-2", {
+      permissions: {
+        edit: "deny",
+        bash: "deny",
+      },
+      authoritativeDelegationPermissions: {
+        permissions: {
+          edit: "ask",
+          bash: "allow",
+          webfetch: "deny",
+          task: "deny",
+        },
+        externalDirectories: ["D:/Omni-Opencode/.worktrees/pty-monitor"],
+      },
+    })
+    secondContext.agent = "codex:gpt-5.4"
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "edit src/core/store.ts" },
+      secondContext as never,
+    )
+
+    const firstLaunch = vi.mocked(runtime.start).mock.calls[0]?.[0]
+    const secondLaunch = vi.mocked(runtime.start).mock.calls[1]?.[0]
+
+    expect(firstContext.ask).toHaveBeenCalledTimes(1)
+    expect(secondContext.ask).not.toHaveBeenCalled()
+    expect(runtime.start).toHaveBeenCalledTimes(2)
+    expect(firstLaunch?.launchMetadata).toEqual(expect.objectContaining({
+      codexPolicy: expect.objectContaining({
+        sandboxMode: "workspace-write",
+      }),
+    }))
+    expect(secondLaunch?.launchMetadata).toEqual(expect.objectContaining({
+      codexPolicy: firstLaunch?.launchMetadata?.codexPolicy,
     }))
   })
 

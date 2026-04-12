@@ -363,13 +363,48 @@ describe("delegated session grant memory", () => {
 })
 
 describe("readDelegationLaunchContext", () => {
+  it("uses authoritative permission input when legacy context permissions disagree", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext({
+      permissions: {
+        edit: "allow",
+        bash: "allow",
+        webfetch: "allow",
+        task: "allow",
+      },
+      authoritativeDelegationPermissions: {
+        permissions: {
+          edit: "ask",
+          bash: "deny",
+          webfetch: "deny",
+          task: "deny",
+        },
+        externalDirectories: ["D:/Authoritative-Only"],
+      },
+    })).resolves.toMatchObject({
+      permissionInput: {
+        permissions: {
+          edit: "ask",
+          bash: "deny",
+          webfetch: "deny",
+          task: "deny",
+        },
+        externalDirectories: ["D:/Authoritative-Only"],
+      },
+    })
+  })
+
   it("uses launch-scoped fallback keys when agent and workspace root are missing", async () => {
     const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
 
     await expect(readDelegationLaunchContext({
       sessionID: "parent-session-1",
       messageID: "message-1",
-      permissions: {},
+      authoritativeDelegationPermissions: {
+        permissions: permissions(),
+        externalDirectories: [],
+      },
     })).resolves.toMatchObject({
       agentKey: "missing-agent:parent-session-1:message-1",
       workspaceRoot: "missing-workspace:parent-session-1:message-1",
@@ -383,30 +418,358 @@ describe("readDelegationLaunchContext", () => {
     const first = await readDelegationLaunchContext({
       sessionID: "parent-session-1",
       messageID: "message-1",
-      permissions: {},
+      authoritativeDelegationPermissions: {
+        permissions: permissions(),
+        externalDirectories: [],
+      },
     })
 
     const second = await readDelegationLaunchContext({
       sessionID: "parent-session-1",
       messageID: "message-2",
-      permissions: {},
+      authoritativeDelegationPermissions: {
+        permissions: permissions(),
+        externalDirectories: [],
+      },
     })
 
     expect(second.agentKey).not.toBe(first.agentKey)
     expect(second.workspaceRoot).not.toBe(first.workspaceRoot)
   })
 
-  it("canonicalizes fallback hash inputs so permission object key order does not change fallback keys", async () => {
+  it("fails closed when authoritative delegation permissions are unavailable", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext({
+      directory: "D:/Omni-Opencode",
+      externalDirectories: ["D:/Shared"],
+    })).rejects.toThrow(/authoritative permission/i)
+  })
+
+  it("fails closed when the current agent has no usable permission payload", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext(
+      {
+        agent: "build",
+        directory: "D:/Omni-Opencode",
+        worktree: "D:/Omni-Opencode",
+        externalDirectories: ["D:/Leaked-Root"],
+      },
+      {
+        app: {
+          agents: async () => [{ name: "build" }],
+        },
+      },
+    )).rejects.toThrow(/agent permission|authoritative permission/i)
+  })
+
+  it("supports host client agents methods that require the app receiver binding", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext(
+      {
+        agent: "build",
+        directory: "D:/Omni-Opencode",
+        worktree: "D:/Omni-Opencode",
+      },
+      {
+        app: {
+          _client: {},
+          async agents(this: { _client?: unknown }) {
+            if (!this._client) {
+              throw new Error("missing bound app client")
+            }
+
+            return {
+              data: [{
+                name: "build",
+                permission: {
+                  edit: "allow",
+                  bash: "allow",
+                  webfetch: "deny",
+                },
+              }],
+            }
+          },
+        },
+      },
+    )).resolves.toMatchObject({
+      permissionInput: {
+        permissions: {
+          edit: "allow",
+          bash: "allow",
+          webfetch: "deny",
+          task: "deny",
+        },
+      },
+    })
+  })
+
+  it("does not fall back to explicit context authority when a live authority client is provided", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext(
+      {
+        agent: "build",
+        directory: "D:/Omni-Opencode",
+        worktree: "D:/Omni-Opencode",
+        authoritativeDelegationPermissions: {
+          permissions: {
+            edit: "allow",
+            bash: "allow",
+            webfetch: "allow",
+            task: "allow",
+          },
+          externalDirectories: ["D:/Fallback-Only"],
+        },
+      },
+      {
+        app: {
+          agents: async () => [{ name: "build" }],
+        },
+      },
+    )).rejects.toThrow(/agent permission|authoritative permission/i)
+  })
+
+  it("does not source delegated roots from raw context fields on the client authority path", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext(
+      {
+        agent: "build",
+        directory: "D:/Omni-Opencode",
+        worktree: "D:/Omni-Opencode",
+        externalDirectories: ["D:/Leaked-Root"],
+        allowedRoots: ["D:/Also-Leaked"],
+      },
+      {
+        app: {
+          agents: async () => [{
+            name: "build",
+            permission: {
+              edit: "allow",
+              bash: { "*": "deny" },
+              webfetch: "deny",
+            },
+          }],
+        },
+      },
+    )).resolves.toMatchObject({
+      permissionInput: {
+        externalDirectories: [],
+      },
+    })
+  })
+
+  it("accepts the real host client agent list envelope when agents() resolves to a data array", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext(
+      {
+        agent: "build",
+        directory: "D:/Omni-Opencode",
+        worktree: "D:/Omni-Opencode",
+      },
+      {
+        app: {
+          agents: async () => ({
+            data: [{
+              name: "build",
+              permission: {
+                edit: "allow",
+                bash: { "*": "deny" },
+                webfetch: "deny",
+              },
+            }],
+          }),
+        },
+      },
+    )).resolves.toMatchObject({
+      agentKey: "build",
+      workspaceRoot: "D:/Omni-Opencode",
+      permissionInput: {
+        permissions: {
+          edit: "allow",
+          bash: "deny",
+          webfetch: "deny",
+          task: "deny",
+        },
+        externalDirectories: [],
+      },
+    })
+  })
+
+  it("derives broad build permissions from a live PermissionRuleset array", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext(
+      {
+        agent: "build",
+        directory: "D:/Omni-Opencode",
+        worktree: "D:/Omni-Opencode",
+      },
+      {
+        app: {
+          agents: async () => ({
+            data: [{
+              name: "build",
+              permission: [
+                { permission: "*", action: "allow", pattern: "*" },
+                { permission: "doom_loop", action: "ask", pattern: "*" },
+                { permission: "external_directory", action: "deny", pattern: "*" },
+              ],
+            }],
+          }),
+        },
+      },
+    )).resolves.toMatchObject({
+      permissionInput: {
+        permissions: {
+          edit: "allow",
+          bash: "allow",
+          webfetch: "allow",
+          task: "allow",
+        },
+      },
+    })
+  })
+
+  it("derives broad plan permissions from a live PermissionRuleset array conservatively", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext(
+      {
+        agent: "plan",
+        directory: "D:/Omni-Opencode",
+        worktree: "D:/Omni-Opencode",
+      },
+      {
+        app: {
+          agents: async () => ({
+            data: [{
+              name: "plan",
+              permission: [
+                { permission: "*", action: "allow", pattern: "*" },
+                { permission: "edit", action: "deny", pattern: "*" },
+                { permission: "edit", action: "allow", pattern: "C:/Users/Administrator/.local/share/opencode/plans/*.md" },
+                { permission: "external_directory", action: "deny", pattern: "*" },
+              ],
+            }],
+          }),
+        },
+      },
+    )).resolves.toMatchObject({
+      permissionInput: {
+        permissions: {
+          edit: "deny",
+          bash: "allow",
+          webfetch: "allow",
+          task: "allow",
+        },
+      },
+    })
+  })
+
+  it("fails closed when live agent permissions indicate external directory access without authoritative roots", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext(
+      {
+        agent: "build",
+        directory: "D:/Omni-Opencode",
+        worktree: "D:/Omni-Opencode",
+      },
+      {
+        app: {
+          agents: async () => [{
+            name: "build",
+            permission: {
+              edit: "deny",
+              bash: { "*": "deny" },
+              webfetch: "deny",
+              external_directory: "allow",
+            },
+          }],
+        },
+      },
+    )).rejects.toThrow(/external directory|authoritative permission/i)
+  })
+
+  it("fails closed when live agent permissions provide a malformed external directory payload", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext(
+      {
+        agent: "build",
+        directory: "D:/Omni-Opencode",
+        worktree: "D:/Omni-Opencode",
+      },
+      {
+        app: {
+          agents: async () => [{
+            name: "build",
+            permission: {
+              edit: "deny",
+              bash: { "*": "deny" },
+              webfetch: "deny",
+              external_directory: { root: "D:/Shared" },
+            },
+          }],
+        },
+      },
+    )).rejects.toThrow(/external directory|authoritative permission/i)
+  })
+
+  it("does not widen broad shell access from partial bash pattern permissions", async () => {
+    const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
+
+    await expect(readDelegationLaunchContext(
+      {
+        agent: "build",
+        directory: "D:/Omni-Opencode",
+        worktree: "D:/Omni-Opencode",
+      },
+      {
+        app: {
+          agents: async () => [{
+            name: "build",
+            permission: {
+              edit: "deny",
+              bash: { npm: "allow" },
+              webfetch: "deny",
+            },
+          }],
+        },
+      },
+    )).resolves.toMatchObject({
+      permissionInput: {
+        permissions: {
+          bash: "deny",
+        },
+      },
+    })
+  })
+
+  it("keeps fallback keys stable even when legacy permission snapshots differ", async () => {
     const { readDelegationLaunchContext } = await loadDelegationLaunchContextModule()
 
     const first = await readDelegationLaunchContext({
       permissions: { edit: "allow", bash: "deny" },
+      authoritativeDelegationPermissions: {
+        permissions: permissions(),
+        externalDirectories: [],
+      },
       directory: "D:/Omni-Opencode",
       externalDirectories: ["D:/Shared"],
     })
 
     const second = await readDelegationLaunchContext({
-      permissions: { bash: "deny", edit: "allow" },
+      permissions: { edit: "deny", bash: "allow", task: "allow" },
+      authoritativeDelegationPermissions: {
+        permissions: permissions(),
+        externalDirectories: [],
+      },
       directory: "D:/Omni-Opencode",
       externalDirectories: ["D:/Shared"],
     })

@@ -8,10 +8,21 @@ function uniqueStateDir(name: string): string {
 }
 
 function makeContext(sessionID: string) {
+  const permissions = {
+    edit: "allow",
+    bash: "allow",
+    webfetch: "deny",
+    task: "deny",
+  } as const
+
   return {
     sessionID,
     messageID: "message-1",
     agent: "test-agent",
+    permissions,
+    authoritativeDelegationPermissions: {
+      permissions,
+    },
     directory: "D:/Omni-Opencode/.worktrees/pty-monitor",
     worktree: "D:/Omni-Opencode/.worktrees/pty-monitor",
     abort: new AbortController().signal,

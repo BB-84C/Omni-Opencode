@@ -5,6 +5,7 @@ import type { JobStartParams } from "../src/adapters/types.js"
 import type { DelegationCapabilities } from "../src/core/delegation-permissions.js"
 import { defaultCodexLaunchPolicy } from "../src/core/codex-policy.js"
 import { toCodexCapabilityPolicy } from "../src/adapters/policy-mappers.js"
+import { loadDelegationPlugin, makeContext } from "./helpers/delegation-plugin-fixture.js"
 
 type CodexCapabilityPolicy = {
   sandboxMode: "read-only" | "workspace-write"
@@ -182,6 +183,81 @@ describe("createCodexAdapter", () => {
     expect((events[0] as { type: string }).type).toBe("status.update")
     expect((events[1] as { type: string }).type).toBe("assistant.delta")
     expect((events[2] as { type: string }).type).toBe("result.final")
+  })
+
+  it("launches Codex with a read-only sandbox from the authoritative envelope", async () => {
+    const { plugin, runtime } = await loadDelegationPlugin({
+      stateName: "codex-authoritative-readonly",
+    })
+    const context = makeContext("parent-session-codex-readonly", "message-1", {
+      permissions: {
+        edit: "allow",
+        bash: "allow",
+        webfetch: "allow",
+      },
+      authoritativeDelegationPermissions: {
+        permissions: {
+          edit: "deny",
+          bash: "deny",
+          webfetch: "allow",
+          task: "deny",
+        },
+        externalDirectories: ["D:/Omni-Opencode/.worktrees/authoritative-readonly"],
+      },
+    })
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "inspect src/plugin.ts" },
+      context as never,
+    )
+
+    expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
+      backend: "codex",
+      launchMetadata: expect.objectContaining({
+        codexPolicy: expect.objectContaining({
+          sandboxMode: "read-only",
+          networkAccess: true,
+          approvalPolicy: "never",
+        }),
+      }),
+    }))
+  })
+
+  it("launches Codex with a workspace-write sandbox from the authoritative envelope", async () => {
+    const { plugin, runtime } = await loadDelegationPlugin({
+      stateName: "codex-authoritative-write-shell",
+    })
+    const context = makeContext("parent-session-codex-write-shell", "message-1", {
+      permissions: {
+        edit: "deny",
+        bash: "deny",
+      },
+      authoritativeDelegationPermissions: {
+        permissions: {
+          edit: "allow",
+          bash: "allow",
+          webfetch: "deny",
+          task: "deny",
+        },
+        externalDirectories: ["D:/Omni-Opencode/.worktrees/pty-monitor"],
+      },
+    })
+
+    await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "edit src/plugin.ts and run npm test" },
+      context as never,
+    )
+
+    expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
+      backend: "codex",
+      launchMetadata: expect.objectContaining({
+        codexPolicy: expect.objectContaining({
+          sandboxMode: "workspace-write",
+          networkAccess: false,
+          approvalPolicy: "never",
+        }),
+      }),
+    }))
   })
 })
 

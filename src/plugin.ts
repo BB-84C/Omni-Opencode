@@ -5,7 +5,6 @@ import { join } from "node:path"
 import { createJobStore } from "./core/store.js"
 import type { ApprovalMode, Backend, DelegationTaskClass, JobRecord, PermissionProfile } from "./core/jobs.js"
 import {
-  classifyDelegationTask,
   normalizeDelegationApprovalChoice,
 } from "./core/session-approval-state.js"
 import {
@@ -180,6 +179,7 @@ type DelegationExecutionContext = {
   messageID: string
   agent?: string
   permissions?: unknown
+  authoritativeDelegationPermissions?: unknown
   externalDirectories?: unknown
   directory?: string
   worktree?: string
@@ -333,6 +333,9 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
   const finalStateOverlay = await loadFinalStateOverlay(finalStateOverlayDir)
   const runtimeSelection = createPluginRuntimeSelection()
   const messageClient = client as ParentSessionMessageClient
+  const authorityClient = typeof (client as { app?: { agents?: unknown } }).app?.agents === "function"
+    ? client
+    : undefined
 
   const canReportToParent =
     typeof messageClient.message?.create === "function" ||
@@ -701,7 +704,7 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     launchContext?: Awaited<ReturnType<typeof readDelegationLaunchContext>>,
     capabilities?: DelegationCapabilities,
   ): Promise<{ approvalMode: ApprovalMode; effectiveCapabilities: DelegationCapabilities }> {
-    const resolvedLaunchContext = launchContext ?? await readDelegationLaunchContext(context)
+    const resolvedLaunchContext = launchContext ?? await readDelegationLaunchContext(context, authorityClient)
     const resolvedCapabilities = capabilities ?? deriveDelegationCapabilities(resolvedLaunchContext.permissionInput)
     const permissionEnvelopeFingerprint = fingerprintDelegationCapabilities(resolvedCapabilities)
     const grantedCapabilities = await delegationGrantStore.get(context.sessionID)
@@ -778,6 +781,28 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     return effectiveCapabilities
   }
 
+  function deriveDelegationMetadataFromCapabilities(capabilities: DelegationCapabilities): {
+    taskClass: DelegationTaskClass
+    permissionProfile: PermissionProfile
+  } {
+    const hasWorkspaceWrite = capabilities.workspaceWrite === "allow"
+    const hasShell = capabilities.shell === "allow"
+    const hasNetwork = capabilities.network === "allow"
+    const hasExternalDirectories = capabilities.allowedRoots.length > 0
+
+    if (hasWorkspaceWrite || hasShell || hasNetwork || hasExternalDirectories) {
+      return {
+        taskClass: "workspace-write",
+        permissionProfile: "dangerous",
+      }
+    }
+
+    return {
+      taskClass: "review",
+      permissionProfile: "safe",
+    }
+  }
+
   async function launchDelegation(
     context: DelegationExecutionContext,
     backend: Backend,
@@ -785,10 +810,10 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
   ): Promise<string> {
     const parentSessionId = context.sessionID
     const parentMessageId = context.messageID
-    const delegationMetadata = classifyDelegationTask(prompt)
-    const currentLaunchContext = await readDelegationLaunchContext(context)
+    const currentLaunchContext = await readDelegationLaunchContext(context, authorityClient)
     const capabilities = deriveDelegationCapabilities(currentLaunchContext.permissionInput)
     const { approvalMode, effectiveCapabilities } = await resolveApprovalMode(context, backend, prompt, currentLaunchContext, capabilities)
+    const delegationMetadata = deriveDelegationMetadataFromCapabilities(effectiveCapabilities)
     const promptFingerprint = buildPromptFingerprint(prompt)
     const correlationMarker = buildCorrelationMarker(parentSessionId, parentMessageId, backend)
     const launchMetadata = {
