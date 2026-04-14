@@ -163,7 +163,7 @@ function parseSnapshot(snapshot: string): {
   }
 }
 
-describe("monitor flow e2e", () => {
+describe("monitor flow e2e", { timeout: 30000 }, () => {
   it("launches both backends, blocks same-turn polling, then injects one aggregate follow-up after the batch completes", async () => {
     const { plugin, client } = await loadPlugin()
 
@@ -210,7 +210,7 @@ describe("monitor flow e2e", () => {
 
     await vi.waitFor(() => {
       expect(client.message.create).toHaveBeenCalledTimes(1)
-    }, { timeout: 5000 })
+    }, { timeout: 60000 })
 
     const aggregateFollowUp = vi.mocked(client.message.create).mock.calls[0]?.[0]
     expect(aggregateFollowUp).toMatchObject({

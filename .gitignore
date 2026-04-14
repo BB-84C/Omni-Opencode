@@ -16,3 +16,4 @@ config.json
 /.omni-monitors
 /.omni-tools
 /.playwright-mcp
+/.release

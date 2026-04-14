@@ -21,6 +21,7 @@ import type { DelegatedCapabilityDecision } from "./core/delegation-permissions.
 import { readDelegationLaunchContext } from "./core/delegation-launch-context.js"
 import { toClaudeCapabilityPolicy } from "./adapters/policy-mappers.js"
 import { toCodexCapabilityPolicy } from "./adapters/policy-mappers.js"
+import { id } from "./plugin-id.js"
 import { extractFinalReport } from "./runtime/extract-report.js"
 import { selectRuntime, type SelectRuntimeOptions, type SelectedRuntime } from "./runtime/select-runtime.js"
 import { appendTranscriptChunk, createTranscript } from "./runtime/transcript.js"
@@ -322,8 +323,6 @@ function normalizeOptionalString(value: unknown): string | undefined {
   const normalized = value.trim()
   return normalized.length > 0 ? normalized : undefined
 }
-
-export const id = "omni-opencode"
 
 export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginInput) => {
   const stateDir = `${directory}/.broker-state`

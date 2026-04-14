@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     environment: "node",
     globals: false,
+    fileParallelism: false,
     include: ["test/**/*.test.ts"],
     coverage: {
       provider: "v8",

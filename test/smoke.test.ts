@@ -10,9 +10,10 @@ describe("repo bootstrap", () => {
     const mod = await import("../src/plugin.js") as typeof import("../src/plugin.js") & {
       default?: { id?: unknown; server?: unknown }
     }
+    const pluginId = await import("../src/plugin-id.js")
     expect(mod.default).toBeTruthy()
-    expect(mod.id).toBe("omni-opencode")
-    expect(mod.default?.id).toBe("omni-opencode")
+    expect(pluginId.id).toBe("omni-opencode")
+    expect(mod.default?.id).toBe(pluginId.id)
     expect(mod.default?.server).toBe(mod.OmniOpencodePlugin)
     expect(mod.server).toBe(mod.OmniOpencodePlugin)
   })

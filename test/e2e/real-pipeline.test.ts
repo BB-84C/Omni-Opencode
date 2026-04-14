@@ -32,7 +32,7 @@ const SKIP_CLAUDE = process.env.SKIP_CLAUDE_E2E === "1"
 const SKIP_CODEX = process.env.SKIP_CODEX_E2E === "1"
 
 // Per-test timeout — real LLM calls can be slow
-const TIMEOUT = 60_000
+const TIMEOUT = 120_000
 
 // ---------------------------------------------------------------------------
 // Shared state

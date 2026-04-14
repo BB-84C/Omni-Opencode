@@ -4,10 +4,29 @@
   "description": "OpenCode plugin for delegated external subagents backed by Codex and Claude Code",
   "type": "module",
   "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": {
+      "import": "./dist/plugin.js",
+      "config": {
+        "enabled": true
+      }
+    },
+    "./tui": {
+      "import": "./dist/tui.js",
+      "config": {
+        "enabled": true
+      }
+    }
+  },
   "scripts": {
     "build": "tsc && tsc -p tsconfig.scripts.json",
     "bootstrap:windows-psmux": "node ./scripts/windows-psmux-bootstrap.mjs",
-    "test": "vitest run",
+    "release:pack": "node ./scripts/package-release.mjs",
+    "test": "vitest run --exclude test/release-install.test.ts",
+    "test:release:contract": "vitest run test/release-manifest.test.ts test/release-package.test.ts",
+    "test:release:install": "npx vitest run test/release-install.test.ts",
+    "test:release": "npm run test:release:contract && npm run test:release:install",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },

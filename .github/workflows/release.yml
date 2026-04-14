@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      PACKAGE_DIR: .release/package
+      ARTIFACT_DIR: .release
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run default test suite
+        run: npm test
+
+      - name: Build project
+        run: npm run build
+
+      - name: Run release verification suite
+        run: npm run test:release
+
+      - name: Assemble canonical release payload
+        run: npm run release:pack -- --output "$PACKAGE_DIR" --artifact-dir "$ARTIFACT_DIR"
+
+      - name: Validate tag matches package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(node -p "require('./package.json').version")"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$package_version" != "$tag_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version $package_version" >&2
+            exit 1
+          fi
+
+      - name: Read release manifest
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_path="$ARTIFACT_DIR/release-manifest.json"
+          echo "manifest_path=$manifest_path" >> "$GITHUB_OUTPUT"
+          echo "name=$(node -p "JSON.parse(require('fs').readFileSync('$manifest_path','utf8')).name")" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "JSON.parse(require('fs').readFileSync('$manifest_path','utf8')).version")" >> "$GITHUB_OUTPUT"
+          echo "npm_tarball=$(node -p "JSON.parse(require('fs').readFileSync('$manifest_path','utf8')).npmTarball")" >> "$GITHUB_OUTPUT"
+          echo "manual_archive=$(node -p "JSON.parse(require('fs').readFileSync('$manifest_path','utf8')).manualArchive")" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure draft GitHub release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release edit "${{ github.ref_name }}" --draft=true
+          else
+            gh release create "${{ github.ref_name }}" --draft --title "${{ github.ref_name }}" --generate-notes
+          fi
+
+      - name: Upload draft release artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" "${{ steps.manifest.outputs.manual_archive }}" --clobber
+
+      - name: Publish npm package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if npm view "${{ steps.manifest.outputs.name }}@${{ steps.manifest.outputs.version }}" version --registry https://registry.npmjs.org >/dev/null 2>&1; then
+            echo "Package version already published; skipping npm publish"
+          else
+            npm publish "${{ steps.manifest.outputs.npm_tarball }}" --access public --provenance
+          fi
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false

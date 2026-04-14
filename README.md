@@ -2,6 +2,41 @@
 
 Plugin-driven OpenCode integration for delegated external subagents backed by Codex and Claude Code.
 
+## Install
+
+### npm
+
+Install through OpenCode's built-in plugin manager with the package name:
+
+```bash
+opencode plugin omni-opencode
+```
+
+OpenCode records the package name in config and resolves the plugin from the package root. In OpenCode's built-in plugin manager, npm-installed packages are expected to show up under `External`. Enable/disable is handled there by OpenCode's built-in plugin manager.
+
+### GitHub Release Artifact
+
+Download the `omni-opencode-<version>-plugin.tar.gz` release artifact, unpack it, then install the unpacked package root:
+
+```bash
+tar -xzf omni-opencode-<version>-plugin.tar.gz
+opencode plugin "/path/to/omni-opencode-<version>"
+```
+
+This uses the same package-root contract as npm. In OpenCode's built-in plugin manager, unpacked package installs are expected to show up under `External`, and OpenCode owns enable/disable state there.
+
+## Plugin Entry Contract
+
+- The package root resolves to `dist/plugin.js` through `package.json` entrypoints.
+- npm installs should reference the package name only, not a file path.
+- Unpacked release artifacts can be installed by pointing `opencode plugin` at the unpacked package root.
+- Local development config entries can point directly at the built plugin file, for example `file:///.../dist/plugin.js`.
+- There is no separate package-internal plugin manifest.
+
+## Release Versioning
+
+- `package.json` version, git tag `v<version>`, and GitHub release tag `v<version>` should align for a public release.
+
 ## Delegation Model
 
 The primary path is tool-driven and batch-aware.
