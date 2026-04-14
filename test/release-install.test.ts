@@ -40,23 +40,7 @@ describe("release install smoke script", () => {
         loadedPluginId: string
         resolvedPluginSpec: string
         pluginOriginSpec: string
-        plugin: {
-          id: string
-          source: string
-          spec: string
-          enabled: boolean
-          active: boolean
-        } | null
-        transitions: {
-          afterDeactivate: {
-            enabled: boolean
-            active: boolean
-          } | null
-          afterReactivate: {
-            enabled: boolean
-            active: boolean
-          } | null
-        } | null
+        moduleRoot: string
       }
       manual: {
         plugin: {
@@ -84,25 +68,7 @@ describe("release install smoke script", () => {
       loadedPluginId: "omni-opencode",
       resolvedPluginSpec: "omni-opencode",
       pluginOriginSpec: "omni-opencode",
-      plugin: {
-        id: "omni-opencode",
-        source: "npm",
-        spec: "omni-opencode",
-        enabled: true,
-        active: false,
-      },
-      transitions: {
-        afterDeactivate: expect.objectContaining({
-          id: "omni-opencode",
-          enabled: false,
-          active: false,
-        }),
-        afterReactivate: expect.objectContaining({
-          id: "omni-opencode",
-          enabled: true,
-          active: true,
-        }),
-      },
+      moduleRoot: expect.stringMatching(/node_modules[\\/]omni-opencode$/),
     })
 
     expect(summary.manual.plugin).toEqual({

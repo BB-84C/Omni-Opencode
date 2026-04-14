@@ -231,12 +231,12 @@ async function runTuiProbe(opencodeExecutable, workspaceRoot, homeRoot, resultPa
 async function runNpmScenario(manifest, opencodeExecutable, tempRoot) {
   const scenarioRoot = join(tempRoot, "npm")
   const workspaceRoot = join(scenarioRoot, "workspace")
+  const configRoot = join(scenarioRoot, "config")
   const homeRoot = join(scenarioRoot, "home")
-  const resultPath = join(scenarioRoot, "result.json")
-  const helperRoot = await createHelperPackage(scenarioRoot, manifest.name, resultPath)
+  const installedPackageRoot = join(scenarioRoot, "node_modules", manifest.name)
 
   await mkdir(workspaceRoot, { recursive: true })
-  await mkdir(join(workspaceRoot, ".opencode"), { recursive: true })
+  await mkdir(configRoot, { recursive: true })
   await mkdir(homeRoot, { recursive: true })
 
   const npm = npmCommand()
@@ -255,19 +255,11 @@ async function runNpmScenario(manifest, opencodeExecutable, tempRoot) {
   })
 
   const npmPlugin = await loadPluginModuleByName(`${manifest.name}/server`, scenarioRoot)
-  await installPluginSpec(opencodeExecutable, helperRoot, homeRoot, workspaceRoot)
 
-  const npmConfigPath = join(workspaceRoot, ".opencode", "opencode.json")
+  const npmConfigPath = join(configRoot, "npm-opencode.json")
   await writeFile(npmConfigPath, JSON.stringify({
     $schema: "https://opencode.ai/config.json",
     plugin: [manifest.name],
-  }, null, 2))
-  await writeFile(join(workspaceRoot, ".opencode", "tui.json"), JSON.stringify({
-    $schema: "https://opencode.ai/tui.json",
-    plugin_enabled: {
-      [pathToFileURL(helperRoot).href]: true,
-      [manifest.name]: true,
-    },
   }, null, 2))
 
   const npmConfig = await readResolvedConfig(npmConfigPath, workspaceRoot, homeRoot)
@@ -278,15 +270,12 @@ async function runNpmScenario(manifest, opencodeExecutable, tempRoot) {
     throw new Error(`Resolved OpenCode config did not retain npm plugin spec ${manifest.name}`)
   }
 
-  const probe = await runTuiProbe(opencodeExecutable, workspaceRoot, homeRoot, resultPath)
-
   return {
     packageName: manifest.name,
     loadedPluginId: npmPlugin.id,
     resolvedPluginSpec: npmEntry,
     pluginOriginSpec: npmOrigin.spec,
-    plugin: probe.plugin,
-    transitions: probe.transitions,
+    moduleRoot: installedPackageRoot,
   }
 }
 
