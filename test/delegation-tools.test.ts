@@ -401,7 +401,11 @@ describe("parent-facing delegation tools", () => {
     }))
 
     const output = await plugin.tool!.delegate_to_claude.execute(
-      { prompt: "inspect the vault door" },
+      {
+        prompt: "inspect the vault door",
+        model: "claude-opus-4-1",
+        reasoningEffort: "high",
+      },
       makeContext("parent-session-1") as never,
     )
     const result = JSON.parse(output) as {
@@ -410,6 +414,10 @@ describe("parent-facing delegation tools", () => {
       parentSessionId: string
       backend: string
       status: string
+      requestedModel: string
+      requestedReasoningEffort: string
+      effectiveModel: string
+      effectiveReasoningEffort: string
       attachCommand: string
       monitorTarget: string
       autoOpenAttempted: boolean
@@ -423,8 +431,8 @@ describe("parent-facing delegation tools", () => {
 
     expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
       backend: "claude-code",
-      command: expect.stringContaining("inspect the vault door"),
-      commandArgs: ["claude", "--print", "inspect the vault door"],
+      command: 'claude --print --model "claude-opus-4-1" --effort "high" "inspect the vault door"',
+      commandArgs: ["claude", "--print", "--model", "claude-opus-4-1", "--effort", "high", "inspect the vault door"],
       launchMetadata: expect.objectContaining({
         claudePolicy: {
           allowedTools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
@@ -434,6 +442,10 @@ describe("parent-facing delegation tools", () => {
         prompt: "inspect the vault door",
         promptFingerprint: expect.any(String),
         correlationMarker: "omni-opencode:parent-session-1:message-1:claude-code",
+        requestedModel: "claude-opus-4-1",
+        requestedReasoningEffort: "high",
+        effectiveModel: "claude-opus-4-1",
+        effectiveReasoningEffort: "high",
       }),
       monitorSessionId: "parent-session-1",
     }))
@@ -444,6 +456,10 @@ describe("parent-facing delegation tools", () => {
       monitorSessionId: "parent-session-1",
       backend: "claude-code",
       status: "running",
+      requestedModel: "claude-opus-4-1",
+      requestedReasoningEffort: "high",
+      effectiveModel: "claude-opus-4-1",
+      effectiveReasoningEffort: "high",
       attachCommand: "attached claude-job-1",
       monitorTarget: "claude-job-1-pty",
       autoOpenAttempted: true,
@@ -470,7 +486,89 @@ describe("parent-facing delegation tools", () => {
     expect(snapshot).toContain('"backendResumeSessionId": "claude-resume-42"')
     expect(snapshot).toContain('"correlationMarker": "omni-opencode:parent-session-1:message-1:claude-code"')
     expect(snapshot).toContain('"promptFingerprint": "')
+    expect(snapshot).toContain('"requestedModel": "claude-opus-4-1"')
+    expect(snapshot).toContain('"requestedReasoningEffort": "high"')
+    expect(snapshot).toContain('"effectiveModel": "claude-opus-4-1"')
+    expect(snapshot).toContain('"effectiveReasoningEffort": "high"')
     expect(snapshot).not.toContain('"childSessionId"')
+  })
+
+  it("reports default model metadata when launch controls are omitted", async () => {
+    const { plugin, runtime } = await loadPlugin("tmux")
+
+    const output = await plugin.tool!.delegate_to_codex.execute(
+      { prompt: "inspect defaults" },
+      makeContext("parent-session-defaults") as never,
+    )
+
+    const result = JSON.parse(output) as {
+      requestedModel?: string
+      requestedReasoningEffort?: string
+      effectiveModel: string
+      effectiveReasoningEffort: string
+    }
+
+    const launch = vi.mocked(runtime.start).mock.calls[0]?.[0]
+
+    expect(launch?.launchMetadata).toEqual(expect.objectContaining({
+      effectiveModel: "default",
+      effectiveReasoningEffort: "default",
+    }))
+    expect(launch?.launchMetadata).not.toHaveProperty("requestedModel")
+    expect(launch?.launchMetadata).not.toHaveProperty("requestedReasoningEffort")
+    expect(result.requestedModel).toBeUndefined()
+    expect(result.requestedReasoningEffort).toBeUndefined()
+    expect(result.effectiveModel).toBe("default")
+    expect(result.effectiveReasoningEffort).toBe("default")
+  })
+
+  it("maps Codex reasoning effort into a supported config override", async () => {
+    const { plugin, runtime } = await loadPlugin("tmux")
+
+    await plugin.tool!.delegate_to_codex.execute(
+      {
+        prompt: "inspect the reactor",
+        model: "gpt-5-codex",
+        reasoningEffort: "high",
+      },
+      makeContext("parent-session-codex") as never,
+    )
+
+    expect(runtime.start).toHaveBeenCalledWith(expect.objectContaining({
+      backend: "codex",
+      command: 'codex exec --color never --model "gpt-5-codex" -c "model_reasoning_effort=\\"high\\"" "inspect the reactor"',
+      commandArgs: [
+        "codex",
+        "exec",
+        "--color",
+        "never",
+        "--model",
+        "gpt-5-codex",
+        "-c",
+        'model_reasoning_effort="high"',
+        "inspect the reactor",
+      ],
+      launchMetadata: expect.objectContaining({
+        requestedModel: "gpt-5-codex",
+        requestedReasoningEffort: "high",
+        effectiveModel: "gpt-5-codex",
+        effectiveReasoningEffort: "high",
+      }),
+    }))
+  })
+
+  it("rejects unsupported Claude reasoning effort values instead of silently dropping them", async () => {
+    const { plugin, runtime } = await loadPlugin("tmux")
+
+    await expect(plugin.tool!.delegate_to_claude.execute(
+      {
+        prompt: "inspect unsupported effort",
+        reasoningEffort: "minimal",
+      },
+      makeContext("parent-session-unsupported") as never,
+    )).rejects.toThrow(/unsupported reasoningEffort/i)
+
+    expect(runtime.start).not.toHaveBeenCalled()
   })
 
   it("returns a Windows psmux attach command scoped to the parent monitor session", async () => {

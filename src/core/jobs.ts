@@ -39,6 +39,12 @@ export type JobRecord = {
   backendThreadId?: string
   backendSessionId?: string
   backendResumeSessionId?: string
+  requestedModel?: string
+  requestedReasoningEffort?: string
+  effectiveModel?: string
+  effectiveReasoningEffort?: string
+  resumedFromJobId?: string
+  rootJobId?: string
   taskClass?: DelegationTaskClass
   permissionProfile?: PermissionProfile
   approvalMode?: ApprovalMode

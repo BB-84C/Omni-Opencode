@@ -18,12 +18,18 @@ export type RuntimeStartParams = {
   commandArgs?: string[]
   launchMetadata?: RuntimeStartLaunchMetadata
   monitorSessionId?: string
+  backendSessionId?: string
+  backendResumeSessionId?: string
 }
 
 export type RuntimeStartLaunchMetadata = {
   prompt: string
   promptFingerprint: string
   correlationMarker: string
+  requestedModel?: string
+  requestedReasoningEffort?: string
+  effectiveModel?: string
+  effectiveReasoningEffort?: string
   claudePolicy?: ClaudeCapabilityPolicy
   codexPolicy?: CodexCapabilityPolicy
 }

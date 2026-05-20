@@ -73,17 +73,75 @@ function delegatedBatchId(parentSessionId: string, parentMessageId: string): str
   return turnKey(parentSessionId, parentMessageId)
 }
 
-function buildDelegationCommand(backend: Backend, prompt: string): string {
-  const escapedPrompt = JSON.stringify(prompt)
-  return backend === "claude-code"
-    ? `claude --print ${escapedPrompt}`
-    : `codex exec --color never ${escapedPrompt}`
+const CODEX_REASONING_EFFORT_LEVELS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"])
+const CLAUDE_REASONING_EFFORT_LEVELS = new Set(["low", "medium", "high", "max"])
+
+function buildCodexReasoningConfigValue(reasoningEffort: string): string {
+  return `model_reasoning_effort="${reasoningEffort}"`
 }
 
-function buildDelegationCommandArgs(backend: Backend, prompt: string): string[] {
+function resolveEffectiveReasoningEffort(backend: Backend, requestedReasoningEffort: string | undefined): string | undefined {
+  if (!requestedReasoningEffort) {
+    return undefined
+  }
+
+  const normalized = requestedReasoningEffort.toLowerCase()
+
+  if (backend === "codex") {
+    if (normalized === "max") {
+      return "xhigh"
+    }
+
+    if (CODEX_REASONING_EFFORT_LEVELS.has(normalized)) {
+      return normalized
+    }
+
+    throw new Error(`Unsupported reasoningEffort ${JSON.stringify(requestedReasoningEffort)} for codex`) 
+  }
+
+  if (normalized === "xhigh") {
+    return "max"
+  }
+
+  if (CLAUDE_REASONING_EFFORT_LEVELS.has(normalized)) {
+    return normalized
+  }
+
+  throw new Error(`Unsupported reasoningEffort ${JSON.stringify(requestedReasoningEffort)} for claude-code`)
+}
+
+function buildDelegationCommand(backend: Backend, prompt: string, controls: DelegationControlParams = {}): string {
+  const escapedPrompt = JSON.stringify(prompt)
+  const requestedModel = normalizeOptionalString(controls.model)
+  const effectiveReasoningEffort = normalizeOptionalString(controls.reasoningEffort)
+  const modelArg = requestedModel ? ` --model ${JSON.stringify(requestedModel)}` : ""
+
   return backend === "claude-code"
-    ? ["claude", "--print", prompt]
-    : ["codex", "exec", "--color", "never", prompt]
+    ? `claude --print${modelArg}${effectiveReasoningEffort ? ` --effort ${JSON.stringify(effectiveReasoningEffort)}` : ""} ${escapedPrompt}`
+    : `codex exec --color never${modelArg}${effectiveReasoningEffort ? ` -c ${JSON.stringify(buildCodexReasoningConfigValue(effectiveReasoningEffort))}` : ""} ${escapedPrompt}`
+}
+
+function buildDelegationCommandArgs(backend: Backend, prompt: string, controls: DelegationControlParams = {}): string[] {
+  const requestedModel = normalizeOptionalString(controls.model)
+  const effectiveReasoningEffort = normalizeOptionalString(controls.reasoningEffort)
+  const args = backend === "claude-code"
+    ? ["claude", "--print"]
+    : ["codex", "exec", "--color", "never"]
+
+  if (requestedModel) {
+    args.push("--model", requestedModel)
+  }
+
+  if (backend === "claude-code" && effectiveReasoningEffort) {
+    args.push("--effort", effectiveReasoningEffort)
+  }
+
+  if (backend === "codex" && effectiveReasoningEffort) {
+    args.push("-c", buildCodexReasoningConfigValue(effectiveReasoningEffort))
+  }
+
+  args.push(prompt)
+  return args
 }
 
 function buildPromptFingerprint(prompt: string): string {
@@ -135,6 +193,10 @@ export function createStoredJobRecord(
     backend: job.backend,
     backendThreadId: job.id,
     ...extractRuntimeBackendSession(job),
+    requestedModel: launchMetadata?.requestedModel,
+    requestedReasoningEffort: launchMetadata?.requestedReasoningEffort,
+    effectiveModel: launchMetadata?.effectiveModel,
+    effectiveReasoningEffort: launchMetadata?.effectiveReasoningEffort,
     taskClass: delegationMetadata.taskClass,
     permissionProfile: delegationMetadata.permissionProfile,
     approvalMode: delegationMetadata.approvalMode,
@@ -168,11 +230,29 @@ type DelegationLaunchResult = {
   monitorSessionId: string
   backend: Backend
   status: "running"
+  resumedFromJobId?: string
+  rootJobId?: string
+  requestedModel?: string
+  requestedReasoningEffort?: string
+  effectiveModel?: string
+  effectiveReasoningEffort?: string
   attachCommand: string
   monitorTarget: string
   autoOpenAttempted: boolean
   autoOpenSucceeded: boolean
   monitor: RuntimeMonitor
+}
+
+type DelegationControlParams = {
+  model?: string
+  reasoningEffort?: string
+}
+
+type ResumeLineage = {
+  resumedFromJobId: string
+  rootJobId: string
+  backendSessionId?: string
+  backendResumeSessionId?: string
 }
 
 type DelegationExecutionContext = {
@@ -322,6 +402,33 @@ function normalizeOptionalString(value: unknown): string | undefined {
 
   const normalized = value.trim()
   return normalized.length > 0 ? normalized : undefined
+}
+
+function resolveResumedControlValue(
+  override: unknown,
+  requestedValue: string | undefined,
+  effectiveValue: string | undefined,
+): string | undefined {
+  const explicitValue = normalizeOptionalString(override)
+  if (explicitValue) {
+    return explicitValue
+  }
+
+  if (requestedValue) {
+    return requestedValue
+  }
+
+  return effectiveValue && effectiveValue !== "default" ? effectiveValue : undefined
+}
+
+function buildDelegatedResumePrompt(sourceJob: StoredJobRecord, injectedPrompt?: string): string {
+  const lines = [
+    "Continue the delegated session from the prior run.",
+    sourceJob.summary ? `Previous summary: ${sourceJob.summary}` : undefined,
+    injectedPrompt ? `Additional instruction: ${injectedPrompt}` : undefined,
+  ]
+
+  return lines.filter((line): line is string => Boolean(line)).join("\n\n")
 }
 
 export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginInput) => {
@@ -806,6 +913,8 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     context: DelegationExecutionContext,
     backend: Backend,
     prompt: string,
+    controls: DelegationControlParams = {},
+    resumeLineage?: ResumeLineage,
   ): Promise<string> {
     const parentSessionId = context.sessionID
     const parentMessageId = context.messageID
@@ -815,20 +924,29 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
     const delegationMetadata = deriveDelegationMetadataFromCapabilities(effectiveCapabilities)
     const promptFingerprint = buildPromptFingerprint(prompt)
     const correlationMarker = buildCorrelationMarker(parentSessionId, parentMessageId, backend)
+    const requestedModel = normalizeOptionalString(controls.model)
+    const requestedReasoningEffort = normalizeOptionalString(controls.reasoningEffort)
+    const effectiveReasoningEffort = resolveEffectiveReasoningEffort(backend, requestedReasoningEffort)
     const launchMetadata = {
       prompt,
       promptFingerprint,
       correlationMarker,
+      ...(requestedModel ? { requestedModel } : {}),
+      ...(requestedReasoningEffort ? { requestedReasoningEffort } : {}),
+      effectiveModel: requestedModel ?? "default",
+      effectiveReasoningEffort: effectiveReasoningEffort ?? "default",
       ...(backend === "claude-code" ? { claudePolicy: toClaudeCapabilityPolicy(effectiveCapabilities) } : {}),
       ...(backend === "codex" ? { codexPolicy: toCodexCapabilityPolicy(effectiveCapabilities) } : {}),
     }
     const started = await preparePluginRuntimeStart(runtimeSelection, {
       backend,
-      command: buildDelegationCommand(backend, prompt),
+      command: buildDelegationCommand(backend, prompt, { model: requestedModel, reasoningEffort: effectiveReasoningEffort }),
       cwd: currentLaunchContext.runtimeCwd,
-      commandArgs: buildDelegationCommandArgs(backend, prompt),
+      commandArgs: buildDelegationCommandArgs(backend, prompt, { model: requestedModel, reasoningEffort: effectiveReasoningEffort }),
       launchMetadata,
       monitorSessionId: parentSessionId,
+      backendSessionId: resumeLineage?.backendSessionId,
+      backendResumeSessionId: resumeLineage?.backendResumeSessionId,
     })
     const monitor = started.monitor ?? started.job.monitor
     const autoOpenSucceeded = didAutoOpenMonitorSucceed({
@@ -836,7 +954,7 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
       autoOpenMonitor: runtimeSelection.autoOpenMonitor,
       startedMonitor: started.monitor,
     })
-    const record = createStoredJobRecord(
+    const storedRecord = createStoredJobRecord(
       delegatedBatchId(parentSessionId, parentMessageId),
       parentSessionId,
       parentMessageId,
@@ -852,6 +970,11 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
       runtimeSelection.autoOpenMonitor,
       autoOpenSucceeded,
     )
+    const record: StoredJobRecord = {
+      ...storedRecord,
+      resumedFromJobId: resumeLineage?.resumedFromJobId,
+      rootJobId: resumeLineage?.rootJobId,
+    }
     await store.save(record)
 
     const result: DelegationLaunchResult = {
@@ -861,6 +984,12 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
       monitorSessionId: record.monitorSessionId ?? parentSessionId,
       backend,
       status: "running",
+      resumedFromJobId: record.resumedFromJobId,
+      rootJobId: record.rootJobId,
+      requestedModel: record.requestedModel,
+      requestedReasoningEffort: record.requestedReasoningEffort,
+      effectiveModel: record.effectiveModel,
+      effectiveReasoningEffort: record.effectiveReasoningEffort,
       attachCommand: monitorAttachCommand(monitor),
       monitorTarget: monitor.attach.target,
       autoOpenAttempted: runtimeSelection.autoOpenMonitor,
@@ -967,8 +1096,10 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           "Delegate a coding or research task to Claude Code, auto-open a live monitor when available, and return monitor metadata immediately. Use this when the user explicitly asks for Claude Code delegation.",
         args: {
           prompt: tool.schema.string().describe("The full task prompt for Claude Code"),
+          model: tool.schema.string().optional().describe("Optional model override for Claude Code"),
+          reasoningEffort: tool.schema.string().optional().describe("Optional reasoning effort override for Claude Code"),
         },
-        async execute({ prompt }, context) {
+        async execute({ prompt, model, reasoningEffort }, context) {
           const currentTurn = turnKey(context.sessionID, context.messageID)
           delegationRequiredTurns.delete(currentTurn)
           delegationLaunchedTurns.add(currentTurn)
@@ -977,7 +1108,7 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           activeBatchLaunches.set(sessionId, (activeBatchLaunches.get(sessionId) ?? 0) + 1)
           scheduleSessionCompletionRetry(sessionId)
           try {
-            return await launchDelegation(context, "claude-code", prompt)
+            return await launchDelegation(context, "claude-code", prompt, { model, reasoningEffort })
           } finally {
             decrementSessionLaunches(sessionId)
           }
@@ -989,8 +1120,10 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           "Delegate a coding or research task to OpenAI Codex, auto-open a live monitor when available, and return monitor metadata immediately. Use this when the user explicitly asks for Codex delegation.",
         args: {
           prompt: tool.schema.string().describe("The full task prompt for Codex"),
+          model: tool.schema.string().optional().describe("Optional model override for Codex"),
+          reasoningEffort: tool.schema.string().optional().describe("Optional reasoning effort override for Codex"),
         },
-        async execute({ prompt }, context) {
+        async execute({ prompt, model, reasoningEffort }, context) {
           const currentTurn = turnKey(context.sessionID, context.messageID)
           delegationRequiredTurns.delete(currentTurn)
           delegationLaunchedTurns.add(currentTurn)
@@ -999,7 +1132,68 @@ export const OmniOpencodePlugin: Plugin = async ({ client, directory }: PluginIn
           activeBatchLaunches.set(sessionId, (activeBatchLaunches.get(sessionId) ?? 0) + 1)
           scheduleSessionCompletionRetry(sessionId)
           try {
-            return await launchDelegation(context, "codex", prompt)
+            return await launchDelegation(context, "codex", prompt, { model, reasoningEffort })
+          } finally {
+            decrementSessionLaunches(sessionId)
+          }
+        },
+      }),
+
+      delegated_job_resume: tool({
+        description: "Resume a completed delegated job via strict backend continuation.",
+        args: {
+          jobId: tool.schema.string().describe("The delegated job ID to resume"),
+          prompt: tool.schema.string().optional().describe("Optional continuation instruction for the resumed backend session"),
+          model: tool.schema.string().optional().describe("Optional model override for the resumed run"),
+          reasoningEffort: tool.schema.string().optional().describe("Optional reasoning effort override for the resumed run"),
+        },
+        async execute({ jobId, prompt, model, reasoningEffort }, context) {
+          const sourceJob = await getJobRecord(jobId)
+          if (!sourceJob) {
+            throw new Error(`Delegated job ${jobId} cannot resume: job not found`)
+          }
+
+          if (sourceJob.status === "running") {
+            throw new Error(`Delegated job ${jobId} cannot resume while it is still running`)
+          }
+
+          if (!sourceJob.backend) {
+            throw new Error(`Delegated job ${jobId} cannot resume: backend is unknown`)
+          }
+
+          const backendResumeSessionId = normalizeOptionalString(sourceJob.backendResumeSessionId)
+          if (!backendResumeSessionId) {
+            throw new Error(`Delegated job ${jobId} cannot resume: no stored backend resume identity`)
+          }
+
+          const currentTurn = turnKey(context.sessionID, context.messageID)
+          delegationRequiredTurns.delete(currentTurn)
+          delegationLaunchedTurns.add(currentTurn)
+          const sessionId = context.sessionID
+          reportedBatchIds.delete(sessionId)
+          activeBatchLaunches.set(sessionId, (activeBatchLaunches.get(sessionId) ?? 0) + 1)
+          scheduleSessionCompletionRetry(sessionId)
+
+          try {
+            return await launchDelegation(
+              context,
+              sourceJob.backend,
+              buildDelegatedResumePrompt(sourceJob, normalizeOptionalString(prompt)),
+              {
+                model: resolveResumedControlValue(model, sourceJob.requestedModel, sourceJob.effectiveModel),
+                reasoningEffort: resolveResumedControlValue(
+                  reasoningEffort,
+                  sourceJob.requestedReasoningEffort,
+                  sourceJob.effectiveReasoningEffort,
+                ),
+              },
+              {
+                resumedFromJobId: sourceJob.jobId,
+                rootJobId: sourceJob.rootJobId ?? sourceJob.jobId,
+                backendSessionId: normalizeOptionalString(sourceJob.backendSessionId),
+                backendResumeSessionId,
+              },
+            )
           } finally {
             decrementSessionLaunches(sessionId)
           }

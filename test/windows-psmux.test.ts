@@ -864,6 +864,10 @@ describe("Windows psmux runtime contract", () => {
         prompt: "inspect the vault door",
         promptFingerprint: "fingerprint-1",
         correlationMarker: "omni-opencode:parent-session-direct-cli:message-1:codex",
+        requestedModel: "gpt-5-codex",
+        requestedReasoningEffort: "medium",
+        effectiveModel: "gpt-5-codex",
+        effectiveReasoningEffort: "medium",
       },
       monitorSessionId: "parent-session-direct-cli",
     })
@@ -881,6 +885,10 @@ describe("Windows psmux runtime contract", () => {
     expect(backendScript).toContain('FromBase64String')
     expect(backendScript).toContain('$omniPrompt')
     expect(backendScript).toContain("$omniCodexArgs = @('exec', '--json', '-')")
+    expect(backendScript).toContain("$omniCodexArgs += '--model'")
+    expect(backendScript).toContain("$omniCodexArgs += 'gpt-5-codex'")
+    expect(backendScript).toContain("$omniCodexArgs += '-c'")
+    expect(backendScript).toContain('model_reasoning_effort="medium"')
     expect(backendScript).toContain('$omniPrompt | & "C:/Program Files/nodejs/node.exe" "C:/tools/node_modules/@openai/codex/bin/codex.js" @omniCodexArgs')
   })
 
@@ -1124,6 +1132,10 @@ describe("Windows psmux runtime contract", () => {
         prompt: "inspect the overseer terminal",
         promptFingerprint: "fingerprint-claude-1",
         correlationMarker: "omni-opencode:parent-session-direct-cli:message-2:claude-code",
+        requestedModel: "claude-opus-4-1",
+        requestedReasoningEffort: "high",
+        effectiveModel: "claude-opus-4-1",
+        effectiveReasoningEffort: "high",
       },
       monitorSessionId: "parent-session-direct-cli",
     })
@@ -1140,6 +1152,8 @@ describe("Windows psmux runtime contract", () => {
     expect(rendererScript).toContain("delta && typeof delta.type === 'string' && delta.type === 'text_delta'")
     expect(backendScript).toContain('& "C:/tools/claude.exe" -p "inspect the overseer terminal')
     expect(backendScript).toContain('--output-format stream-json --verbose --include-partial-messages')
+    expect(backendScript).toContain('--model claude-opus-4-1')
+    expect(backendScript).toContain('--effort high')
     expect(backendScript).toContain("--permission-mode bypassPermissions")
     expect(backendScript).toContain("--allowedTools Read,Glob,Grep,Edit,Write,Bash")
     expect(backendScript).toContain("--disallowedTools WebFetch,WebSearch")

@@ -260,6 +260,104 @@ describe("completion reporting", () => {
     expect(snapshot).toContain('"promptFingerprint": "')
   })
 
+  it("injects a new aggregate follow-up for a resumed batch instead of reusing the original batch report", async () => {
+    const { plugin, client } = await loadPlugin({
+      readOutputByJobId: {
+        "claude-job-1": [JSON.stringify({
+          finalReport: {
+            summary: "Initial batch finished",
+            changedFiles: ["src/plugin.ts"],
+          },
+        })],
+        "claude-job-2": [JSON.stringify({
+          finalReport: {
+            summary: "Resumed batch finished",
+            changedFiles: ["src/plugin.ts"],
+          },
+        })],
+      },
+      snapshotJobsByCall: [
+        [
+          {
+            id: "claude-job-1",
+            backend: "claude-code",
+            command: 'claude --print "report back"',
+            status: "running",
+            monitor: {
+              id: "monitor-parent-session-1",
+              attach: { mode: "pty", target: "parent-session-1:dashboard" },
+              launch: { command: "psmux attach -t parent-session-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
+            },
+          },
+        ],
+        [
+          {
+            id: "claude-job-1",
+            backend: "claude-code",
+            command: 'claude --print "report back"',
+            status: "stopped",
+            monitor: {
+              id: "monitor-parent-session-1",
+              attach: { mode: "pty", target: "parent-session-1:dashboard" },
+              launch: { command: "psmux attach -t parent-session-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
+            },
+          },
+        ],
+        [
+          {
+            id: "claude-job-2",
+            backend: "claude-code",
+            command: 'claude --print "continue with more detail"',
+            status: "running",
+            monitor: {
+              id: "monitor-parent-session-1",
+              attach: { mode: "pty", target: "parent-session-1:dashboard" },
+              launch: { command: "psmux attach -t parent-session-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
+            },
+          },
+        ],
+        [
+          {
+            id: "claude-job-2",
+            backend: "claude-code",
+            command: 'claude --print "continue with more detail"',
+            status: "stopped",
+            monitor: {
+              id: "monitor-parent-session-1",
+              attach: { mode: "pty", target: "parent-session-1:dashboard" },
+              launch: { command: "psmux attach -t parent-session-1", cwd: "D:/Omni-Opencode/.worktrees/pty-monitor" },
+            },
+          },
+        ],
+      ],
+    })
+
+    await plugin.tool!.delegate_to_claude.execute(
+      { prompt: "report back", model: "claude-opus-4-1", reasoningEffort: "medium" },
+      makeContext("parent-session-1") as never,
+    )
+
+    await vi.waitFor(() => {
+      expect(client.message!.create).toHaveBeenCalledTimes(1)
+    })
+
+    vi.mocked(client.message!.create).mockClear()
+
+    const resumed = JSON.parse(await plugin.tool!.delegated_job_resume.execute(
+      { jobId: "parent-session-1:claude-job-1", prompt: "continue with more detail" },
+      makeContext("parent-session-1") as never,
+    )) as { jobId: string }
+
+    await vi.waitFor(() => {
+      expect(client.message!.create).toHaveBeenCalledTimes(1)
+    })
+
+    const resumedUpdate = vi.mocked(client.message!.create).mock.calls[0]?.[0]?.content
+    expect(resumedUpdate).toContain("1 delegated job(s) finished.")
+    expect(resumedUpdate).toContain(resumed.jobId)
+    expect(resumedUpdate).not.toContain("parent-session-1:claude-job-1")
+  })
+
   it("waits for every job in a mixed terminal batch and injects a concise follow-up with inspection references", async () => {
     const verboseSummary = [
       "Structured completion report follows.",

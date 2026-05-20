@@ -1360,6 +1360,10 @@ async function buildWindowsPsmuxStructuredBackendCommand(
           codexCommand,
           promptText,
           codexConfigPath,
+          {
+            model: params.launchMetadata?.requestedModel,
+            reasoningEffort: params.launchMetadata?.effectiveReasoningEffort,
+          },
         ),
       ),
       rendererNodeCommand: codexCommand.kind === "node-script" ? codexCommand.nodeCommand : undefined,
@@ -1373,7 +1377,10 @@ async function buildWindowsPsmuxStructuredBackendCommand(
     scriptPath: await writeWindowsPsmuxDelegatedBackendScript(
       logDirectory,
       backendScriptKey,
-      buildWindowsPsmuxClaudeBackendScript(backendCommand, promptText, claudePolicy),
+      buildWindowsPsmuxClaudeBackendScript(backendCommand, promptText, claudePolicy, {
+        model: params.launchMetadata?.requestedModel,
+        reasoningEffort: params.launchMetadata?.effectiveReasoningEffort,
+      }),
     ),
     rendererNodeCommand: nodeCommand,
   }
@@ -1485,17 +1492,28 @@ function buildWindowsPsmuxCodexBackendScript(
   command: WindowsPsmuxCodexCommand,
   promptText: string,
   configPath?: string,
+  controls: { model?: string; reasoningEffort?: string } = {},
 ): string {
   const invocation = command.kind === "node-script"
     ? `& "${escapeWindowsPsmuxDoubleQuotedString(command.nodeCommand)}" "${escapeWindowsPsmuxDoubleQuotedString(command.codexScriptPath)}"`
     : `& "${escapeWindowsPsmuxDoubleQuotedString(command.backendCommand)}"`
 
   const encodedPrompt = Buffer.from(promptText, "utf8").toString("base64")
+  const codexReasoningConfig = controls.reasoningEffort && controls.reasoningEffort !== "default"
+    ? `model_reasoning_effort="${controls.reasoningEffort}"`
+    : undefined
+  const controlArgLines = [
+    controls.model ? "$omniCodexArgs += '--model'" : undefined,
+    controls.model ? `$omniCodexArgs += '${escapeWindowsPsmuxPowerShellString(controls.model)}'` : undefined,
+    codexReasoningConfig ? "$omniCodexArgs += '-c'" : undefined,
+    codexReasoningConfig ? `$omniCodexArgs += '${escapeWindowsPsmuxPowerShellString(codexReasoningConfig)}'` : undefined,
+  ].filter((line): line is string => line !== undefined)
 
   if (!configPath) {
     return [
       `$omniPrompt = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${escapeWindowsPsmuxPowerShellString(encodedPrompt)}'))`,
       `$omniCodexArgs = @('exec', '--json', '-')`,
+      ...controlArgLines,
       `$omniPrompt | ${invocation} @omniCodexArgs`,
       "",
     ].join("\n")
@@ -1505,6 +1523,7 @@ function buildWindowsPsmuxCodexBackendScript(
     `$omniCodexPolicy = Get-Content -Raw '${escapeWindowsPsmuxPowerShellString(configPath)}' | ConvertFrom-Json`,
     `$omniPrompt = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${escapeWindowsPsmuxPowerShellString(encodedPrompt)}'))`,
     "$omniCodexArgs = @('exec', '--json', '-')",
+    ...controlArgLines,
     "$omniCodexArgs += '-c'",
     "$omniCodexArgs += ('sandbox_mode=\"' + [string]$omniCodexPolicy.sandboxMode + '\"')",
     "$omniCodexArgs += '-c'",
@@ -1527,7 +1546,17 @@ export function buildWindowsPsmuxClaudeBackendScript(
   backendCommand: string,
   promptText: string,
   policy?: ClaudeCapabilityPolicy,
+  controls: { model?: string; reasoningEffort?: string } = {},
 ): string {
+  const controlFlags = [
+    controls.model
+      ? ` --model ${escapeWindowsPsmuxCliArgument(controls.model)}`
+      : "",
+    controls.reasoningEffort && controls.reasoningEffort !== "default"
+      ? ` --effort ${escapeWindowsPsmuxCliArgument(controls.reasoningEffort)}`
+      : "",
+  ].join("")
+
   const permissionFlags = [
     policy?.permissionMode
       ? ` --permission-mode ${escapeWindowsPsmuxCliArgument(policy.permissionMode)}`
@@ -1540,7 +1569,7 @@ export function buildWindowsPsmuxClaudeBackendScript(
       : "",
   ].join("")
 
-  return `& "${escapeWindowsPsmuxDoubleQuotedString(backendCommand)}" -p "${escapeWindowsPsmuxDoubleQuotedString(promptText)}" --output-format stream-json --verbose --include-partial-messages${permissionFlags}\n`
+  return `& "${escapeWindowsPsmuxDoubleQuotedString(backendCommand)}" -p "${escapeWindowsPsmuxDoubleQuotedString(promptText)}" --output-format stream-json --verbose --include-partial-messages${controlFlags}${permissionFlags}\n`
 }
 
 function escapeWindowsPsmuxCliArgument(value: string): string {
